@@ -10,12 +10,18 @@ import {
 	vaultRoot,
 	type SyncProvider,
 } from "./src/config";
+import { consolidate } from "./src/consolidate";
+import { embedPendingEpisodes, recordEpisode } from "./src/episodic";
+import { rebuildGraph } from "./src/graph";
 import { buildGraph } from "./src/graph-builder";
+import { renderAffected, renderExplain, renderMap, renderPath } from "./src/graph-render";
 import { indexStatus } from "./src/hybrid-search";
 import { resetIndex } from "./src/index-db";
 import { reindex } from "./src/indexer";
 import { integrate, integrationStatus, unintegrate } from "./src/integrate";
 import { recall, recallMarkdown } from "./src/recall";
+import { digest, finishSession, prime } from "./src/session-memory";
+import type { EpisodeKind } from "./src/transcript";
 import { configureSync, startSyncSchedule, syncNow, syncStatus } from "./src/sync";
 import { restartWatcher, startWatcher } from "./src/watcher";
 
@@ -60,6 +66,45 @@ async function fullStatus() {
 	};
 }
 
+function textResponse(text: string): Response {
+	return new Response(text, { headers: { "content-type": "text/plain; charset=utf-8" } });
+}
+
+/** Traversal verbs. Arguments are resolved through recall, so plain English works. */
+async function handleGraphVerb(verb: string, url: URL): Promise<Response> {
+	const q = url.searchParams.get("q") ?? "";
+	if (verb === "path") {
+		const from = url.searchParams.get("from") ?? "";
+		const to = url.searchParams.get("to") ?? "";
+		if (!from || !to) return jsonResponse({ error: "missing from/to" }, 400);
+		return textResponse(await renderPath(from, to));
+	}
+	if (verb === "map") return textResponse(renderMap(url.searchParams.has("examples")));
+	if (verb === "rebuild") return jsonResponse(rebuildGraph());
+	if (!q) return jsonResponse({ error: "missing q" }, 400);
+	if (verb === "explain") return textResponse(await renderExplain(q));
+	if (verb === "affected") {
+		return textResponse(await renderAffected(q, Number(url.searchParams.get("depth") ?? "2") || 2));
+	}
+	return jsonResponse({ error: `unknown graph verb: ${verb}` }, 404);
+}
+
+/** Session lifecycle for the Claude Code hooks: start / prompt / end. */
+async function handleSession(action: string, payload: unknown): Promise<Response> {
+	const body = (payload ?? {}) as Record<string, unknown>;
+	const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+	if (!sessionId) return jsonResponse({ error: "missing sessionId" }, 400);
+	const cwd = typeof body.cwd === "string" ? body.cwd : "";
+
+	if (action === "start") return textResponse(digest({ sessionId, cwd }));
+	if (action === "prompt") {
+		const prompt = typeof body.prompt === "string" ? body.prompt : "";
+		return textResponse(await prime({ sessionId, cwd, prompt }));
+	}
+	if (action === "end") return jsonResponse(await finishSession(sessionId));
+	return jsonResponse({ error: `unknown session action: ${action}` }, 404);
+}
+
 /** Switch vaults: validate, persist, wipe the old corpus index, rebuild, re-watch. */
 async function switchVault(path: string): Promise<Response> {
 	try {
@@ -77,6 +122,8 @@ async function switchVault(path: string): Promise<Response> {
 
 const server = Bun.serve({
 	port: PORT,
+	// A cold graph build or first consolidation can outrun the 10 s default.
+	idleTimeout: 60,
 	async fetch(req) {
 		const url = new URL(req.url);
 		const post = req.method === "POST";
@@ -95,15 +142,46 @@ const server = Bun.serve({
 
 		if (url.pathname === "/api/recall") {
 			const q = url.searchParams.get("q") ?? "";
-			const k = Number(url.searchParams.get("k") ?? "6") || 6;
-			const p = url.searchParams.get("p") ?? undefined;
 			if (!q.trim()) return jsonResponse({ error: "missing q" }, 400);
+			const options = {
+				k: Number(url.searchParams.get("k") ?? "6") || 6,
+				pathPrefix: url.searchParams.get("p") ?? undefined,
+				sessionId: url.searchParams.get("session") ?? undefined,
+				episodeK: url.searchParams.has("episodes") ? Number(url.searchParams.get("episodes")) || 0 : undefined,
+				full: url.searchParams.has("full"),
+			};
 			if (url.searchParams.get("format") === "md") {
-				return new Response(await recallMarkdown(q, k, p), {
+				return new Response(await recallMarkdown(q, options), {
 					headers: { "content-type": "text/plain; charset=utf-8" },
 				});
 			}
-			return jsonResponse({ query: q, hits: await recall(q, k, p) });
+			return jsonResponse({ query: q, hits: await recall(q, options) });
+		}
+
+		if (url.pathname.startsWith("/api/graph/")) {
+			return handleGraphVerb(url.pathname.slice("/api/graph/".length), url);
+		}
+
+		if (url.pathname.startsWith("/api/session/") && post) {
+			return handleSession(url.pathname.slice("/api/session/".length), await req.json());
+		}
+
+		if (url.pathname === "/api/episode" && post) {
+			const body = (await req.json()) as Record<string, unknown>;
+			const str = (v: unknown) => (typeof v === "string" ? v : "");
+			return jsonResponse({
+				id: recordEpisode({
+					sessionId: str(body.sessionId) || "manual",
+					cwd: str(body.cwd),
+					kind: (str(body.kind) || "decision") as EpisodeKind,
+					text: str(body.text),
+					salience: typeof body.salience === "number" ? body.salience : 1.6,
+				}),
+			});
+		}
+
+		if (url.pathname === "/api/consolidate" && post) {
+			return jsonResponse(consolidate(Number(url.searchParams.get("days") ?? "30") || 30));
 		}
 
 		if (url.pathname === "/api/note") {
@@ -159,6 +237,17 @@ const server = Bun.serve({
 console.log(`claude-brain serving on http://localhost:${server.port}`);
 startWatcher();
 startSyncSchedule();
+
+// Drain any episodes captured while the server was down, then keep consolidating in
+// the background so a long-running daemon doesn't accumulate unabstracted history.
+void embedPendingEpisodes();
+const CONSOLIDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+setInterval(() => {
+	const report = consolidate(3);
+	if (report.ingestedEpisodes > 0 || report.forgotten.forgotten > 0) {
+		console.log(`[consolidate] +${report.ingestedEpisodes} episodes, -${report.forgotten.forgotten} forgotten`);
+	}
+}, CONSOLIDATE_INTERVAL_MS).unref();
 
 process.on("SIGTERM", () => process.exit(0));
 process.on("SIGINT", () => process.exit(0));

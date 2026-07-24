@@ -1,8 +1,8 @@
 # Maintainer: claude-brain maintainers
 pkgname=claude-brain
-pkgver=0.1.2
+pkgver=0.2.0
 pkgrel=1
-pkgdesc="A local second brain for Claude Code: hybrid recall over your markdown vault, 3D knowledge graph, cloud sync (Dropbox / Google Drive / MEGA)"
+pkgdesc="A local second brain for Claude Code: hybrid recall over notes and past sessions, episodic memory, note-graph traversal, 3D visualisation, cloud sync"
 arch=('x86_64' 'aarch64')
 url="https://aur.archlinux.org/packages/claude-brain"
 license=('MIT')

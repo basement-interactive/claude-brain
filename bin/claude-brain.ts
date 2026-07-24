@@ -53,25 +53,162 @@ async function cmdOpen(): Promise<void> {
 	console.log(`brain open at ${BASE}`);
 }
 
+/**
+ * Claude Code exports the live session as CLAUDE_CODE_SESSION_ID. Passing it lets the
+ * brain treat a session as one context: episodes are filed against the right session,
+ * and a note already shown this session is not sent twice.
+ */
+function sessionIdFromEnv(): string | undefined {
+	return process.env.CLAUDE_CODE_SESSION_ID || undefined;
+}
+
+function postJson(path: string, body: unknown): Promise<Response | null> {
+	return api(path, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+}
+
 async function cmdRecall(rest: string[]): Promise<void> {
 	let prefix: string | undefined;
 	const pIdx = rest.indexOf("-p");
 	if (pIdx !== -1) prefix = rest.splice(pIdx, 2)[1];
+	let episodes: string | undefined;
+	const eIdx = rest.indexOf("-e");
+	if (eIdx !== -1) episodes = rest.splice(eIdx, 2)[1];
+	// Snippets are trimmed to the answering lines; --full restores whole sections.
+	const fullIdx = rest.indexOf("--full");
+	const full = fullIdx !== -1;
+	if (full) rest.splice(fullIdx, 1);
 	let k = 6;
 	if (rest.length > 1 && /^\d+$/.test(rest[rest.length - 1] ?? "")) k = Number(rest.pop());
 	const query = rest.join(" ").trim();
 	if (!query) {
-		console.error('claude-brain recall "<query>" [k] [-p <folder-prefix>]');
+		console.error('claude-brain recall "<query>" [k] [-p <folder>] [-e <episodes>] [--full]');
 		process.exit(1);
 	}
-	const pArg = prefix ? `&p=${encodeURIComponent(prefix)}` : "";
-	const res = await api(`/api/recall?q=${encodeURIComponent(query)}&k=${k}&format=md${pArg}`);
+	const params = new URLSearchParams({ q: query, k: String(k), format: "md" });
+	if (prefix) params.set("p", prefix);
+	if (episodes !== undefined) params.set("episodes", episodes);
+	if (full) params.set("full", "1");
+	const session = sessionIdFromEnv();
+	if (session) params.set("session", session);
+	const res = await api(`/api/recall?${params}`);
 	if (res) {
 		console.log(await res.text());
 		return;
 	}
 	const { recallMarkdownStandalone } = await import("../src/recall");
-	console.log(await recallMarkdownStandalone(query, k));
+	console.log(await recallMarkdownStandalone(query, { k, pathPrefix: prefix, full }));
+}
+
+/**
+ * Durable episodic capture — a decision or preference worth surviving the session but
+ * not structured enough to deserve a note. Higher salience, so consolidation keeps it
+ * when the surrounding chatter is forgotten.
+ */
+async function cmdRemember(rest: string[]): Promise<void> {
+	let kind = "decision";
+	const kIdx = rest.indexOf("-k");
+	if (kIdx !== -1) kind = rest.splice(kIdx, 2)[1] ?? "decision";
+	const text = rest.join(" ").trim();
+	if (!text) {
+		console.error('claude-brain remember "<text>" [-k decision|preference|outcome]');
+		process.exit(1);
+	}
+	await ensureServer();
+	await postJson("/api/episode", {
+		sessionId: sessionIdFromEnv() ?? "manual",
+		cwd: process.cwd(),
+		kind,
+		text,
+		salience: 2,
+	});
+	console.log(`remembered (${kind}): ${text.slice(0, 80)}`);
+}
+
+/** Graph verbs. All resolve their arguments through recall, so plain English works. */
+async function cmdGraph(verb: string, rest: string[]): Promise<void> {
+	const params = new URLSearchParams();
+	if (verb === "path") {
+		const [from, to] = [rest[0] ?? "", rest[1] ?? ""];
+		if (!from || !to) {
+			console.error('claude-brain path "<from>" "<to>"');
+			process.exit(1);
+		}
+		params.set("from", from);
+		params.set("to", to);
+	} else if (verb !== "map") {
+		const query = rest.filter((a) => !a.startsWith("-")).join(" ").trim();
+		if (!query) {
+			console.error(`claude-brain ${verb} "<note>"`);
+			process.exit(1);
+		}
+		params.set("q", query);
+		const depth = rest.indexOf("-d");
+		if (depth !== -1) params.set("depth", rest[depth + 1] ?? "2");
+	}
+	await ensureServer();
+	const res = await api(`/api/graph/${verb}?${params}`);
+	if (!res) {
+		console.error("claude-brain: graph verbs need the server — try `claude-brain serve`");
+		process.exit(1);
+	}
+	console.log((await res.text()).trimEnd());
+}
+
+async function cmdConsolidate(rest: string[]): Promise<void> {
+	const days = Number(rest[0] ?? "30") || 30;
+	const res = await postJson(`/api/consolidate?days=${days}`, {});
+	if (!res) {
+		const { consolidate } = await import("../src/consolidate");
+		console.log(JSON.stringify(consolidate(days), null, 2));
+		return;
+	}
+	console.log(JSON.stringify(await res.json(), null, 2));
+}
+
+interface HookPayload {
+	session_id?: string;
+	cwd?: string;
+	prompt?: string;
+}
+
+/**
+ * Hook entrypoints, reading Claude Code's JSON on stdin. Every one fails silently and
+ * exits 0 — a brain that can break the session it is trying to help is a liability.
+ */
+async function cmdHook(event: string): Promise<void> {
+	let payload: HookPayload = {};
+	try {
+		const raw = await Bun.stdin.text();
+		if (raw.trim()) payload = JSON.parse(raw) as HookPayload;
+	} catch {
+		/* no payload — fall back to the environment */
+	}
+	const sessionId = payload.session_id ?? sessionIdFromEnv() ?? "";
+	const cwd = payload.cwd ?? process.cwd();
+	if (!sessionId) return;
+
+	if (event === "session-start") {
+		const res = await postJson("/api/session/start", { sessionId, cwd });
+		if (res) console.log((await res.text()).trim());
+		return;
+	}
+	if (event === "prompt") {
+		const res = await postJson("/api/session/prompt", { sessionId, cwd, prompt: payload.prompt ?? "" });
+		const text = res ? (await res.text()).trim() : "";
+		if (text) console.log(text);
+		return;
+	}
+	if (event === "session-end") {
+		const res = await postJson("/api/session/end", { sessionId, cwd });
+		if (!res) return;
+		const report = (await res.json()) as { captured: number; proposals: string[] };
+		console.error(`[brain] captured ${report.captured} episodes from this session`);
+		for (const p of report.proposals) console.error(`[brain] recurring — ${p}`);
+	}
 }
 
 async function cmdNote(rest: string[]): Promise<void> {
@@ -186,6 +323,21 @@ switch (cmd) {
 	case "note":
 		await cmdNote(rest);
 		break;
+	case "remember":
+		await cmdRemember(rest);
+		break;
+	case "path":
+	case "explain":
+	case "affected":
+	case "map":
+		await cmdGraph(cmd, rest);
+		break;
+	case "consolidate":
+		await cmdConsolidate(rest);
+		break;
+	case "hook":
+		await cmdHook(rest[0] ?? "");
+		break;
 	case "vault":
 		await cmdVault(rest);
 		break;
@@ -207,12 +359,26 @@ switch (cmd) {
 	default:
 		console.log(`usage:
   claude-brain                       open the brain UI
-  claude-brain recall "<query>" [k] [-p <folder>]  search your vault (folder-scoped with -p)
+
+ recall
+  claude-brain recall "<query>" [k] [-p <folder>] [-e <n>] [--full]
+                                     search notes and past sessions
   claude-brain note "<text>" [-f <subfolder>]      quick-capture (default Inbox/)
+  claude-brain remember "<text>" [-k decision|preference|outcome]
+                                     store a durable fact in episodic memory
+
+ structure
+  claude-brain path "<from>" "<to>"  how two notes connect
+  claude-brain explain "<note>"      a note and everything around it
+  claude-brain affected "<note>" [-d N]   what points at it, transitively
+  claude-brain map                   the vault as named clusters
+
+ upkeep
   claude-brain vault <path>          choose where your brain lives
   claude-brain sync setup <provider> connect dropbox | gdrive | mega
   claude-brain sync now              sync to the cloud now
   claude-brain integrate [--remove]  wire into Claude Code
+  claude-brain consolidate [days]    mine session logs, abstract, forget
   claude-brain status | reindex | serve | context`);
 		process.exit(cmd ? 1 : 0);
 }

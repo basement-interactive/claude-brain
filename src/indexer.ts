@@ -1,14 +1,16 @@
 // Incremental vault indexer: content-hash diff against the persistent index, so a
-// reindex touches only added/changed/removed notes. Wikilinks are stored as doc→doc
-// edges for ranking boosts.
+// reindex touches only added/changed/removed notes. Wikilinks are stored as typed
+// doc→doc edges carrying the relation implied by their surroundings.
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, extname, join, relative, sep } from "node:path";
 import { chunkNote, stripFrontmatter, titleOf } from "./chunker";
-import { IGNORED_DIR_NAMES, vaultReady, vaultRoot } from "./config";
 import { embedTexts } from "./embedder";
+import { scheduleGraphRebuild } from "./graph";
 import { resolveLink } from "./graph-builder";
 import { openBrainDb, setMeta } from "./index-db";
+import { parseLinks, parseTags } from "./relations";
+import { IGNORED_DIR_NAMES, vaultReady, vaultRoot } from "./config";
 
 export interface IndexStats {
 	indexed: number;
@@ -19,8 +21,6 @@ export interface IndexStats {
 	chunks: number;
 	skipped?: string;
 }
-
-const WIKILINK_RE = /\[\[([^\]]+)\]\]/g;
 
 interface VaultFile {
 	relPath: string;
@@ -97,6 +97,7 @@ async function runReindex(): Promise<IndexStats> {
 
 	const stats: IndexStats = { indexed: 0, updated: 0, removed: 0, unchanged: 0, docs: 0, chunks: 0 };
 	const seen = new Set<string>();
+	const bodies = new Map<string, string>();
 
 	const upsertDoc = db.query(
 		`INSERT INTO docs (path, title, hash, mtime, size) VALUES (?, ?, ?, ?, ?)
@@ -134,6 +135,7 @@ async function runReindex(): Promise<IndexStats> {
 
 		const body = stripFrontmatter(raw);
 		const title = titleOf(body, basename(f.relPath).replace(/\.md$/i, ""));
+		bodies.set(f.relPath, body);
 
 		db.transaction(() => {
 			if (prev) {
@@ -148,6 +150,9 @@ async function runReindex(): Promise<IndexStats> {
 				const chunkId = (insertChunk.get(docId, chunk.heading || title, chunk.pos, chunk.text) as { id: number }).id;
 				insertFts.run(chunkId, title, chunk.heading || title, chunk.text);
 			}
+			db.query("DELETE FROM doc_tags WHERE doc_id = ?").run(docId);
+			const insertTag = db.query("INSERT OR IGNORE INTO doc_tags (doc_id, tag) VALUES (?, ?)");
+			for (const tag of parseTags(raw)) insertTag.run(docId, tag);
 		})();
 		if (prev) stats.updated++;
 		else stats.indexed++;
@@ -166,7 +171,11 @@ async function runReindex(): Promise<IndexStats> {
 		stats.removed++;
 	}
 
-	if (stats.indexed || stats.updated || stats.removed) rebuildLinks(root);
+	// A new or deleted note changes what every other note's wikilinks resolve to, so
+	// only that case pays for a full re-resolve; an edit re-links just the edited note.
+	if (stats.indexed || stats.removed) rebuildAllLinks(root);
+	else if (stats.updated) relinkChanged(bodies);
+	if (stats.indexed || stats.updated || stats.removed) scheduleGraphRebuild();
 	setMeta(db, "last_index", new Date().toISOString());
 
 	Object.assign(stats, countStats());
@@ -174,8 +183,12 @@ async function runReindex(): Promise<IndexStats> {
 	return stats;
 }
 
-/** Wikilink edges, recomputed whole (cheap at vault scale, avoids stale-edge bookkeeping). */
-function rebuildLinks(root: string): void {
+interface LinkResolver {
+	idByPath: Map<string, number>;
+	byBasename: Map<string, string[]>;
+}
+
+function loadResolver(): LinkResolver {
 	const { db } = openBrainDb();
 	const idByPath = new Map<string, number>();
 	const byBasename = new Map<string, string[]>();
@@ -186,23 +199,85 @@ function rebuildLinks(root: string): void {
 		list.push(row.path);
 		byBasename.set(key, list);
 	}
+	return { idByPath, byBasename };
+}
+
+/** Outgoing edges for one note, replacing whatever it pointed at before. */
+function linkOne(resolver: LinkResolver, path: string, body: string): void {
+	const { db } = openBrainDb();
+	const sourceId = resolver.idByPath.get(path);
+	if (!sourceId) return;
+	db.query("DELETE FROM links WHERE source_doc = ?").run(sourceId);
+	const insert = db.query(
+		"INSERT OR IGNORE INTO links (source_doc, target_doc, relation, context) VALUES (?, ?, ?, ?)",
+	);
+	for (const link of parseLinks(body)) {
+		const target = resolveLink(link.target, resolver.byBasename, path);
+		if (!target || target === path) continue;
+		const targetId = resolver.idByPath.get(target);
+		if (targetId) insert.run(sourceId, targetId, link.relation, link.context);
+	}
+}
+
+/**
+ * Re-read every note purely for its structure — typed wikilinks and frontmatter tags.
+ * The incremental path never revisits an unchanged file, so a newly added structural
+ * field (relations, tags) has no other way to reach notes that predate it.
+ */
+export function refreshStructure(): { docs: number; tags: number } {
+	const root = vaultRoot();
+	if (!root) return { docs: 0, tags: 0 };
+	const { db } = openBrainDb();
+	const resolver = loadResolver();
+	let tags = 0;
 	db.transaction(() => {
 		db.run("DELETE FROM links");
-		const insert = db.query("INSERT OR IGNORE INTO links (source_doc, target_doc) VALUES (?, ?)");
-		for (const [path, id] of idByPath) {
+		db.run("DELETE FROM doc_tags");
+		const insertTag = db.query("INSERT OR IGNORE INTO doc_tags (doc_id, tag) VALUES (?, ?)");
+		for (const [path, id] of resolver.idByPath) {
 			let raw: string;
 			try {
 				raw = readFileSync(join(root, path), "utf-8");
 			} catch {
 				continue;
 			}
-			for (const m of raw.matchAll(WIKILINK_RE)) {
-				const target = resolveLink(m[1] ?? "", byBasename, path);
-				if (!target || target === path) continue;
-				const targetId = idByPath.get(target);
-				if (targetId) insert.run(id, targetId);
+			linkOne(resolver, path, raw);
+			for (const tag of parseTags(raw)) {
+				insertTag.run(id, tag);
+				tags++;
 			}
 		}
+	})();
+	return { docs: resolver.idByPath.size, tags };
+}
+
+/** Re-resolve every note. Needed only when the set of link targets itself changed. */
+function rebuildAllLinks(root: string): void {
+	const { db } = openBrainDb();
+	const resolver = loadResolver();
+	db.transaction(() => {
+		db.run("DELETE FROM links");
+		for (const path of resolver.idByPath.keys()) {
+			let raw: string;
+			try {
+				raw = readFileSync(join(root, path), "utf-8");
+			} catch {
+				continue;
+			}
+			linkOne(resolver, path, raw);
+		}
+	})();
+}
+
+/**
+ * Re-link only the notes whose content changed, reusing the bodies the indexer already
+ * read. Saves re-reading the whole vault off the external SSD on every single edit.
+ */
+function relinkChanged(bodies: Map<string, string>): void {
+	const { db } = openBrainDb();
+	const resolver = loadResolver();
+	db.transaction(() => {
+		for (const [path, body] of bodies) linkOne(resolver, path, body);
 	})();
 }
 
@@ -213,8 +288,8 @@ export async function embedPending(): Promise<number> {
 	const { db, vectors } = openBrainDb();
 	if (!vectors || embedding) return 0;
 	embedding = true;
+	let total = 0;
 	try {
-		let total = 0;
 		for (;;) {
 			const pending = db
 				.query(
@@ -223,7 +298,7 @@ export async function embedPending(): Promise<number> {
 				)
 				.all() as Array<{ id: number; title: string; heading: string; text: string }>;
 			if (pending.length === 0) return total;
-			// Title prefixed into every embedded chunk for cheap relevance gain.
+			// qmd trick: prefix title into every embedded chunk for cheap relevance gain.
 			const vecs = await embedTexts(pending.map((p) => `${p.title} | ${p.heading} | ${p.text}`));
 			if (!vecs) return total;
 			db.transaction(() => {
@@ -240,5 +315,7 @@ export async function embedPending(): Promise<number> {
 		}
 	} finally {
 		embedding = false;
+		// New vectors mean new similarity edges — the graph is now one step stale.
+		if (total > 0) scheduleGraphRebuild();
 	}
 }

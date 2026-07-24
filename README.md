@@ -11,9 +11,23 @@ your own cloud account.
 
 - **Hybrid recall** — BM25 full-text (SQLite FTS5) + local semantic embeddings
   (all-MiniLM-L6-v2 via ONNX, 384-dim, sqlite-vec) fused with reciprocal-rank fusion,
-  wikilink-graph ranking boosts, best-section-per-note pooling. ~100 ms queries,
-  finds notes by meaning ("laptop battery drains fast" → your power-tuning note).
-- **3D knowledge graph** — every note a neuron, wikilinks as synapses, folders as
+  graph ranking boosts, best-section-per-note pooling. ~100 ms queries, finds notes by
+  meaning ("laptop battery drains fast" → your power-tuning note). Results are trimmed
+  to the lines that answer the question, not the whole section.
+- **Episodic memory** — the brain also remembers *what happened*, not just what you
+  wrote down. Past sessions are mined from Claude Code's own transcripts, so recall
+  answers "have we hit this before" alongside "what do we know". Nothing episodic is
+  written to your vault; it lives in the local index only.
+- **Memory that behaves like memory** — retrieving a note strengthens it, unused
+  traces decay on a power-law curve, and recall spreads one hop along your links to
+  surface the neighbouring note you didn't ask for. Recurring themes across separate
+  sessions get flagged as candidates worth writing down.
+- **Note graph you can traverse** — `path` between two notes, `explain` a note's
+  neighbourhood, `affected` for everything pointing at it, `map` for the whole vault
+  as named clusters. Links are typed from context (`caused_by`, `fixed_by`,
+  `supersedes`, …) and supplemented by similarity, tag and timeline edges. No LLM
+  anywhere: it rebuilds in ~100 ms on every change, so it is never stale.
+- **3D knowledge graph** — every note a neuron, links as synapses, folders as
   lobes, with search, category filters, and an in-graph note reader.
 - **Always fresh** — a file watcher reindexes seconds after you edit a note.
   Content-hash incremental: only changed notes are re-chunked and re-embedded.
@@ -23,8 +37,9 @@ your own cloud account.
   **MEGA** (via rclone; credentials stay in rclone on your machine). Dated remote
   trash folder protects against accidental deletions.
 - **Claude Code integration** — one click wires it in: recall-first instructions,
-  a SessionStart hook injecting brain status, and a recording skill so sessions
-  save what they learned (work log, solved bugs, quick captures) as new notes.
+  hooks that orient at session start, quietly cue relevant memory as you work, and
+  consolidate at session end, plus a recording skill so sessions save what they
+  learned as new notes.
 
 ## Install
 
@@ -48,15 +63,28 @@ claude-brain sync setup dropbox   # or: gdrive, mega
 CLI reference:
 
 ```
-claude-brain recall "<query>" [k] [-p <folder>]  hybrid search (folder-scoped with -p)
+claude-brain recall "<query>" [k] [-p <folder>] [-e <n>] [--full]
+                                   search notes and past sessions
 claude-brain note "<text>" [-f <subfolder>]      quick-capture (default Inbox/)
+claude-brain remember "<text>" [-k decision|preference|outcome]
+                                   store a durable fact in episodic memory
+
+claude-brain path "<from>" "<to>"  how two notes connect, hop by hop
+claude-brain explain "<note>"      a note and everything around it
+claude-brain affected "<note>"     what points at it, transitively
+claude-brain map                   the vault as named clusters
+
 claude-brain vault <path>          choose where your brain lives
 claude-brain sync setup <provider> connect dropbox | gdrive | mega
 claude-brain sync now              sync to the cloud now
 claude-brain integrate [--remove]  wire into / out of Claude Code
+claude-brain consolidate [days]    mine session logs, abstract, forget
 claude-brain status                index + sync + integration state
 claude-brain serve                 run the server in the foreground
 ```
+
+The graph verbs resolve their arguments through recall, so you can describe a note
+instead of naming it exactly: `claude-brain path "the audio crash" "deploy notes"`.
 
 To keep the brain always on (recommended — recall stays warm for Claude Code):
 
@@ -78,8 +106,12 @@ of the above.
 
 ## Privacy
 
-- No telemetry, no external calls. Embeddings and search are fully local.
-- Cloud sync is off until you connect an account; it targets only your own storage.
+- No telemetry, no external calls. Embeddings, search, clustering and graph building
+  are fully local — there is no LLM in any pipeline and no API key to configure.
+- Episodic memory is read from Claude Code's session logs already on your disk and
+  stored only in the local index. It is never written into your vault and never synced.
+- Cloud sync is off until you connect an account; it targets only your own storage and
+  mirrors your vault, not the index.
 - `claude-brain integrate --remove` cleanly removes everything it added to `~/.claude`.
 
 ## License
