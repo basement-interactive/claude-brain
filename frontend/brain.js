@@ -20,6 +20,7 @@ import { Effect } from "@babylonjs/core/Materials/effect";
 import { DynamicTexture } from "@babylonjs/core/Materials/Textures/dynamicTexture";
 import { VertexBuffer } from "@babylonjs/core/Buffers/buffer";
 import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
+import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/defaultRenderingPipeline";
 import "@babylonjs/core/Culling/ray"; // side-effect: enables scene.pick
 import { forceLink, forceManyBody, forceSimulation } from "d3-force-3d";
 
@@ -32,9 +33,18 @@ const IDLE_ROTATE_SPEED = 0.045; // radians / second
 const CLUSTER_STRENGTH = 0.9;
 const HUB_LABEL_MIN_CONNECTIONS = 7;
 const PULSE_INTERVAL_MS = 1000 / 30; // halo breathing runs at most 30fps
+const PICK_INTERVAL_MS = 50; // hover picking at most 20 Hz
 const SIM_TICKS = 300;
-const BACKGROUND = new Color4(5 / 255, 5 / 255, 8 / 255, 1);
+const BACKGROUND = new Color4(1 / 255, 1 / 255, 2 / 255, 1);
+const FLY_SPEED = 130; // units / second; Shift multiplies
 const DIM = new Color3(0x17 / 255, 0x1b / 255, 0x2e / 255);
+
+// Anatomical brain proportions the layout settles into: an ellipsoid longer
+// front-to-back than wide, wider than tall, split into two hemispheres.
+const BRAIN = { x: 150, y: 120, z: 200 };
+const FISSURE_HALF_WIDTH = 14;
+const SHELL_INNER = 0.62; // nodes live in the cortical shell, not the deep interior
+const SPARK_COUNT = 320;
 
 Effect.ShadersStore.brainUnlitVertexShader = `
 precision highp float;
@@ -57,7 +67,9 @@ precision highp float; varying vec4 vColor; varying vec2 vUV;
 void main() {
 	float d = distance(vUV, vec2(0.5));
 	float a = smoothstep(0.5, 0.0, d);
-	gl_FragColor = vec4(vColor.rgb * a * a * vColor.a, 1.0);
+	// Steep falloff keeps halos as tight rims instead of washing the scene out.
+	a = pow(a, 4.0);
+	gl_FragColor = vec4(vColor.rgb * a * vColor.a, 1.0);
 }`;
 
 function hexToColor3(hex) {
@@ -142,22 +154,82 @@ export function createBrainTab(container) {
 	// Scene
 	// -------------------------------------------------------------------------
 
-	const engine = new Engine(canvas, true, { powerPreference: "high-performance" });
+	// MSAA off — the pipeline's FXAA is cheaper and bloom hides the difference.
+	const engine = new Engine(canvas, false, { powerPreference: "high-performance" });
 	engine.setHardwareScalingLevel(1 / Math.min(window.devicePixelRatio || 1, 1.5));
 	const scene = new Scene(engine);
 	scene.clearColor = BACKGROUND;
 	scene.fogMode = Scene.FOGMODE_EXP2;
 	scene.fogDensity = 0.0004;
 	scene.fogColor = new Color3(BACKGROUND.r, BACKGROUND.g, BACKGROUND.b);
+	scene.skipPointerMovePicking = true; // we pick ourselves, throttled
 
 	const camera = new ArcRotateCamera("cam", -Math.PI / 2, Math.PI / 2.15, 1600, Vector3.Zero(), scene);
-	camera.attachControl(canvas, true);
+	// noPreventDefault must stay false — otherwise the browser keeps wheel events and zoom dies.
+	camera.attachControl(canvas, false);
+	// Right-drag rotates too — the context menu would otherwise swallow button 2.
+	canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 	camera.minZ = 1;
-	camera.maxZ = 6000;
-	camera.wheelPrecision = 2;
+	camera.maxZ = 8000;
+	camera.wheelDeltaPercentage = 0.05; // proportional zoom: snappy far out, precise up close
+	camera.pinchDeltaPercentage = 0.01;
 	camera.panningSensibility = 0;
-	camera.lowerRadiusLimit = 60;
-	camera.upperRadiusLimit = 3000;
+	camera.lowerRadiusLimit = 15; // close enough to inspect a single neuron from inside
+	camera.upperRadiusLimit = 4000;
+
+	// HDR-style bloom is what makes the neurons read as light sources; FXAA smooths
+	// lines; grain + vignette give the void some texture. One pipeline, GPU-side.
+	const pipeline = new DefaultRenderingPipeline("brainFx", true, scene, [camera]);
+	pipeline.fxaaEnabled = true;
+	pipeline.bloomEnabled = true;
+	pipeline.bloomThreshold = 0.45;
+	pipeline.bloomWeight = 0.6;
+	pipeline.bloomKernel = 64;
+	pipeline.bloomScale = 0.5;
+	pipeline.imageProcessingEnabled = true;
+	pipeline.imageProcessing.vignetteEnabled = true;
+	pipeline.imageProcessing.vignetteWeight = 1.6;
+	pipeline.imageProcessing.contrast = 1.08;
+	pipeline.imageProcessing.exposure = 1.0;
+	pipeline.grainEnabled = true;
+	pipeline.grain.intensity = 3.5; // any higher and the void reads grey instead of black
+	pipeline.grain.animated = true;
+
+	// Free-roam: WASD flies camera + orbit pivot together (QE / Space+C for vertical),
+	// Shift is afterburner. Mouse keeps orbiting around wherever you've flown to.
+	const flyKeys = new Set();
+	const isTyping = () => {
+		const a = document.activeElement;
+		return a && (a.tagName === "INPUT" || a.tagName === "TEXTAREA");
+	};
+	document.addEventListener("keydown", (e) => {
+		if (!visible || isTyping()) return;
+		flyKeys.add(e.code);
+	});
+	document.addEventListener("keyup", (e) => flyKeys.delete(e.code));
+	window.addEventListener("blur", () => flyKeys.clear());
+
+	function applyFly(dt) {
+		if (flyKeys.size === 0) return false;
+		const forward = camera.target.subtract(camera.position);
+		forward.normalize();
+		const right = Vector3.Cross(camera.upVector, forward).normalize();
+		const move = Vector3.Zero();
+		if (flyKeys.has("KeyW")) move.addInPlace(forward);
+		if (flyKeys.has("KeyS")) move.subtractInPlace(forward);
+		if (flyKeys.has("KeyD")) move.addInPlace(right);
+		if (flyKeys.has("KeyA")) move.subtractInPlace(right);
+		if (flyKeys.has("KeyE") || flyKeys.has("Space")) move.addInPlace(camera.upVector);
+		if (flyKeys.has("KeyQ") || flyKeys.has("KeyC")) move.subtractInPlace(camera.upVector);
+		if (move.lengthSquared() === 0) return false;
+		move.normalize();
+		const speed = FLY_SPEED * (flyKeys.has("ShiftLeft") || flyKeys.has("ShiftRight") ? 4 : 1) * dt;
+		move.scaleInPlace(speed);
+		camera.target.addInPlace(move);
+		camera.position.addInPlace(move);
+		lastInteraction = Date.now();
+		return true;
+	}
 
 	const coreMat = new ShaderMaterial("coreMat", scene, "brainUnlit", {
 		attributes: ["position", "color"],
@@ -174,6 +246,8 @@ export function createBrainTab(container) {
 
 	let coreSps = null;
 	let haloSps = null;
+	let sparkSps = null;
+	let sparkMeta = []; // per spark: { edge: index, phase: 0..1, speed }
 	let linesMesh = null;
 	const labels = new Map(); // node id -> plane mesh
 	let radii = [];
@@ -263,6 +337,9 @@ export function createBrainTab(container) {
 		const coreMesh = coreSps.buildMesh();
 		coreMesh.material = coreMat;
 		coreMesh.alwaysSelectAsActiveMesh = true;
+		// Picking ray-tests the mesh bounding box first; keep it in sync as the
+		// layout moves particles far from their build-time positions.
+		coreSps.computeBoundingBox = true;
 
 		// Halos: additive billboard planes, second SPS.
 		const haloProto = CreatePlane("haloProto", { size: 2 }, scene);
@@ -290,24 +367,128 @@ export function createBrainTab(container) {
 
 		applyEmphasis();
 
-		// Force layout (d3 simulates, Babylon renders).
+		// Force layout (d3 simulates, Babylon renders). Three anatomy forces shape a
+		// real brain: category anchors pinned onto the cortex of a brain-proportioned
+		// ellipsoid (hemispheres alternating), a shell force that keeps nodes in the
+		// cortical band instead of the deep interior, and a longitudinal-fissure force
+		// that carves the hemisphere split.
 		const simLinks = graphData.edges.map((e) => ({ source: e.source, target: e.target, kind: e.kind }));
 		simulation = forceSimulation(nodes, 3)
-			.force("link", forceLink(simLinks).id((d) => d.id).distance((l) => (l.kind === "timeline" ? 65 : 42)))
-			.force("charge", forceManyBody().strength(-55))
+			.force("link", forceLink(simLinks).id((d) => d.id).distance((l) => (l.kind === "timeline" ? 85 : 55)))
+			.force("charge", forceManyBody().strength(-95))
 			.stop();
-		const anchors = new Map(graphData.categories.map((c) => [c.id, c.anchor]));
-		simulation.force("cluster", (alpha) => {
+
+		const cats = graphData.categories;
+		const anchors = new Map(
+			cats.map((c, i) => {
+				// Golden-spiral point on the unit sphere, biased to the upper cortex,
+				// stretched onto brain proportions, mirrored into alternating hemispheres.
+				const golden = Math.PI * (3 - Math.sqrt(5));
+				const y = 0.15 + (i / Math.max(cats.length - 1, 1)) * 0.8; // upper bias
+				const r = Math.sqrt(Math.max(0, 1 - y * y));
+				const theta = golden * i;
+				const side = i % 2 === 0 ? 1 : -1;
+				return [
+					c.id,
+					{
+						x: side * Math.max(Math.abs(Math.cos(theta) * r) * BRAIN.x, FISSURE_HALF_WIDTH * 2.5),
+						y: y * BRAIN.y,
+						z: Math.sin(theta) * r * BRAIN.z,
+					},
+				];
+			}),
+		);
+
+		simulation.force("anatomy", (alpha) => {
 			for (const node of nodes) {
 				const anchor = anchors.get(node.category);
-				if (!anchor) continue;
-				const k = (node.connections === 0 ? 3 : 1) * CLUSTER_STRENGTH * alpha * 0.05;
-				node.vx += (anchor.x - node.x) * k;
-				node.vy += (anchor.y - node.y) * k;
-				node.vz += (anchor.z - node.z) * k;
+				if (anchor) {
+					const k = (node.connections === 0 ? 3 : 1) * CLUSTER_STRENGTH * alpha * 0.05;
+					node.vx += (anchor.x - node.x) * k;
+					node.vy += (anchor.y - node.y) * k;
+					node.vz += (anchor.z - node.z) * k;
+				}
+				// Cortical shell: radial push toward the [SHELL_INNER, 1] band of the ellipsoid.
+				const ex = node.x / BRAIN.x;
+				const ey = node.y / BRAIN.y;
+				const ez = node.z / BRAIN.z;
+				const e = Math.sqrt(ex * ex + ey * ey + ez * ez) || 1e-6;
+				const shellK = 0.6 * alpha;
+				if (e > 1) {
+					node.vx -= node.x * (1 - 1 / e) * shellK;
+					node.vy -= node.y * (1 - 1 / e) * shellK;
+					node.vz -= node.z * (1 - 1 / e) * shellK;
+				} else if (e < SHELL_INNER) {
+					const out = (SHELL_INNER / e - 1) * shellK;
+					node.vx += node.x * out;
+					node.vy += node.y * out;
+					node.vz += node.z * out;
+				}
+				// Longitudinal fissure: keep the hemisphere gap clear.
+				if (Math.abs(node.x) < FISSURE_HALF_WIDTH) {
+					node.vx += (node.x >= 0 ? 1 : -1) * (FISSURE_HALF_WIDTH - Math.abs(node.x)) * alpha * 0.9;
+				}
 			}
 		});
 		simTicksLeft = SIM_TICKS;
+		buildSparks();
+	}
+
+	// Synapse signals: sparks travel the edges — the brain visibly "thinks".
+	// One SPS, one draw call, reuses the halo's radial shader.
+	function buildSparks() {
+		const edgeCount = graphData.edges.length;
+		if (!edgeCount) return;
+		const count = Math.min(SPARK_COUNT, edgeCount * 2);
+		const proto = CreatePlane("sparkProto", { size: 2 }, scene);
+		sparkSps = new SolidParticleSystem("sparks", scene, { isPickable: false });
+		sparkSps.addShape(proto, count);
+		proto.dispose();
+		sparkSps.billboard = true;
+		const mesh = sparkSps.buildMesh();
+		mesh.material = haloMat;
+		mesh.isPickable = false;
+		mesh.alwaysSelectAsActiveMesh = true;
+		sparkMeta = Array.from({ length: count }, () => ({
+			edge: Math.floor(Math.random() * edgeCount),
+			phase: Math.random(),
+			speed: 0.1 + Math.random() * 0.2,
+		}));
+	}
+
+	function updateSparks(dt) {
+		if (!sparkSps) return;
+		for (let i = 0; i < sparkMeta.length; i++) {
+			const m = sparkMeta[i];
+			m.phase += m.speed * dt;
+			if (m.phase >= 1) {
+				// Respawn on a fresh edge so activity wanders the whole brain.
+				m.phase = 0;
+				m.edge = Math.floor(Math.random() * graphData.edges.length);
+			}
+			const e = graphData.edges[m.edge];
+			const s = nodeById.get(e.source);
+			const t = nodeById.get(e.target);
+			const p = sparkSps.particles[i];
+			const visible = s && t && nodeVisible(s) && nodeVisible(t);
+			if (!visible) {
+				p.scaling.setAll(0.0001);
+				continue;
+			}
+			const state = linkEmphasis(e);
+			p.position.set(
+				s.x + (t.x - s.x) * m.phase,
+				s.y + (t.y - s.y) * m.phase,
+				s.z + (t.z - s.z) * m.phase,
+			);
+			// Fade in and out along the run; dimmed edges barely spark.
+			const arc = Math.sin(m.phase * Math.PI);
+			const base = hexToColor3(categoryOf(s)?.color ?? "#7dd3fc");
+			const alpha = state === "dim" ? 0.04 : state === "hi" ? 0.9 : 0.45;
+			p.scaling.setAll(1.6 + arc * 1.2);
+			p.color = new Color4(base.r, base.g, base.b, alpha * arc);
+		}
+		sparkSps.setParticles();
 	}
 
 	function syncPositions() {
@@ -344,13 +525,13 @@ export function createBrainTab(container) {
 			const base = hexToColor3(categoryOf(n)?.color ?? "#94a3b8");
 			const r = radii[i];
 			core.scaling.setAll(hidden ? 0.0001 : r);
-			halo.scaling.setAll(hidden ? 0.0001 : r * 10);
+			halo.scaling.setAll(hidden ? 0.0001 : r * 5);
 			if (state === "dim") {
 				core.color = new Color4(DIM.r, DIM.g, DIM.b, 1);
-				halo.color = new Color4(base.r, base.g, base.b, 0.05);
+				halo.color = new Color4(base.r, base.g, base.b, 0.03);
 			} else {
 				core.color = new Color4(base.r, base.g, base.b, 1);
-				halo.color = new Color4(base.r, base.g, base.b, state === "hi" ? 0.85 : 0.5);
+				halo.color = new Color4(base.r, base.g, base.b, state === "hi" ? 0.55 : 0.28);
 			}
 			n.__state = hidden ? "hidden" : state;
 		}
@@ -386,12 +567,22 @@ export function createBrainTab(container) {
 					cr = base.r; cg = base.g; cb = base.b; ca = state === "hi" ? 1 : 0.32;
 				}
 			}
-			for (const off of [0, 4]) {
-				data[i * 8 + off] = cr;
-				data[i * 8 + off + 1] = cg;
-				data[i * 8 + off + 2] = cb;
-				data[i * 8 + off + 3] = ca;
+			// Gradient stroke: source tint at one end, target tint at the other.
+			let tr = cr;
+			let tg = cg;
+			let tb = cb;
+			if (state !== "hidden" && state !== "dim" && e.kind !== "timeline") {
+				const tBase = hexToColor3(categoryOf(t)?.color ?? "#7dd3fc");
+				tr = tBase.r; tg = tBase.g; tb = tBase.b;
 			}
+			data[i * 8] = cr;
+			data[i * 8 + 1] = cg;
+			data[i * 8 + 2] = cb;
+			data[i * 8 + 3] = ca;
+			data[i * 8 + 4] = tr;
+			data[i * 8 + 5] = tg;
+			data[i * 8 + 6] = tb;
+			data[i * 8 + 7] = ca;
 		});
 		linesMesh.setVerticesData(VertexBuffer.ColorKind, data, true);
 	}
@@ -413,8 +604,12 @@ export function createBrainTab(container) {
 		return node && nodeVisible(node) ? node : null;
 	}
 
+	let lastPick = 0;
 	canvas.addEventListener("pointermove", () => {
 		if (!coreSps) return;
+		const now = performance.now();
+		if (now - lastPick < PICK_INTERVAL_MS) return;
+		lastPick = now;
 		const node = pickNode();
 		if (node !== hoveredNode) {
 			hoveredNode = node;
@@ -665,10 +860,15 @@ export function createBrainTab(container) {
 				flownIn = true;
 				let maxR = 0;
 				for (const n of graphData.nodes) maxR = Math.max(maxR, Math.hypot(n.x, n.y, n.z));
-				glideCamera(Vector3.Zero(), Math.max(maxR * 2.3, 300), 2000);
+				// Settle into a three-quarter profile — the brain silhouette reads best there.
+				camera.alpha = -Math.PI / 2 + 0.6;
+				camera.beta = Math.PI / 2.4;
+				glideCamera(Vector3.Zero(), Math.max(maxR * 2.1, 300), 2000);
 				lastInteraction = Date.now();
 			}
 		}
+
+		if (applyFly(dt)) cameraGlide = null; // manual flight overrides any camera glide
 
 		if (cameraGlide) {
 			const t = Math.min((now - cameraGlide.start) / cameraGlide.ms, 1);
@@ -686,12 +886,13 @@ export function createBrainTab(container) {
 					const n = graphData.nodes[i];
 					if (n.__state === "hidden" || n.__state === "dim") continue;
 					const pulse = 1 + 0.08 * Math.sin(t * 1.4 + (i % 32) / 5);
-					haloSps.particles[i].scaling.setAll(radii[i] * 10 * pulse);
+					haloSps.particles[i].scaling.setAll(radii[i] * 5 * pulse);
 				}
 			}
 			// Billboards face the camera on setParticles; keep them honest while orbiting.
 			haloSps.setParticles();
 		}
+		if (!reducedMotion) updateSparks(dt);
 
 		const idle =
 			!reducedMotion &&
