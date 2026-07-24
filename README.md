@@ -27,6 +27,17 @@ your own cloud account.
   as named clusters. Links are typed from context (`caused_by`, `fixed_by`,
   `supersedes`, …) and supplemented by similarity, tag and timeline edges. No LLM
   anywhere: it rebuilds in ~100 ms on every change, so it is never stale.
+- **Design memory** — drop screenshots of designs you like into the dashboard. Because
+  recall is text, the brain converts each one into a written description of its design
+  language (palette hex, spacing scale, typography, radii, shadows, motion, mood) and
+  files it as a real note in your vault. Later, "build me a landing page like that
+  dashboard I saved" actually resolves: `claude-brain design show "<vibe>"` prints the
+  description and the image path.
+- **`claude-brain reorganize`** — proposes a topical folder structure for a vault that
+  grew organically, and files notes into it. It plans by default and moves nothing; only
+  `--apply` touches the vault and `--undo` reverses it. It never renames, merges or
+  deletes, and it refuses outright on a vault whose Obsidian link format would break
+  links on a move.
 - **3D knowledge graph** — every note a neuron, links as synapses, folders as
   lobes, with search, category filters, and an in-graph note reader.
 - **Always fresh** — a file watcher reindexes seconds after you edit a note.
@@ -103,6 +114,17 @@ systemctl --user enable --now claude-brain
 
 Your notes stay wherever you put your vault. Uninstalling the package touches none
 of the above.
+
+## Using your own Claude
+
+Two features need judgement rather than search — describing a design, and deciding which
+folder a note belongs in. Both call **your own already-authenticated `claude` CLI**; there
+is no API key to configure and nothing is sent anywhere else.
+
+Both are **off by default**. Nothing spends your Claude quota until you turn them on in
+Settings, and there is a daily budget you can set. With them off, uploads are still stored
+and listed (marked "disabled"), and everything else in the brain — recall, the graph,
+episodic memory — is unaffected, because none of it uses an LLM at all.
 
 ## Privacy
 
