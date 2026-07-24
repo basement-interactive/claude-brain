@@ -1,0 +1,11 @@
+[Unit]
+Description=claude-brain second brain server
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/bun /usr/share/claude-brain/server.ts
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

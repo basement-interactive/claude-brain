@@ -1,0 +1,25 @@
+{
+	"name": "claude-brain",
+	"version": "0.1.0",
+	"description": "A local second brain for Claude Code: hybrid recall over your markdown vault, 3D knowledge graph, cloud sync.",
+	"license": "MIT",
+	"type": "module",
+	"private": true,
+	"scripts": {
+		"build": "bun build frontend/dashboard.js --outfile public/bundle.js --minify",
+		"start": "bun server.ts"
+	},
+	"trustedDependencies": [
+		"onnxruntime-node"
+	],
+	"devDependencies": {
+		"@types/bun": "latest",
+		"typescript": "^5"
+	},
+	"dependencies": {
+		"3d-force-graph": "^1.80.0",
+		"fastembed": "^2.1.0",
+		"sqlite-vec": "^0.1.9",
+		"three": "^0.185.1"
+	}
+}
