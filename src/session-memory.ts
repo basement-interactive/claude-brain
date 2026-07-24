@@ -22,8 +22,22 @@ import { clearPriming, indexStatus } from "./hybrid-search";
 import { ago, recall } from "./recall";
 import { findTranscript, mineTranscript } from "./transcript";
 
-/** Below this a hit is a coincidence, not a memory. */
-const MIN_SCORE = 0.035;
+/**
+ * Injection threshold, calibrated against labelled prompts rather than guessed.
+ * Prompts that genuinely name something the vault knows score 0.093–0.221; ordinary
+ * working instructions ("rename the variable", "make it a bit smaller") score
+ * 0.084–0.110 because the ranker always returns its best guess. 0.12 sits above the
+ * overlap.
+ *
+ * This trades recall for precision on purpose. A wrong injection costs tokens on every
+ * turn and adds noise to reason around; a missed one costs nothing, because an explicit
+ * `claude-brain recall` is always available. For an always-on hook, precision is the
+ * only setting that stays welcome.
+ *
+ * Calibrated on one technical vault; a corpus with a very different score distribution
+ * may want this moved.
+ */
+const MIN_SCORE = 0.12;
 /** And a hit far weaker than the best one is noise next to it. */
 const RELATIVE_FLOOR = 0.5;
 const MAX_NOTES = 2;
@@ -46,7 +60,7 @@ export function digest({ sessionId, cwd }: DigestOptions): string {
 	const status = indexStatus();
 	const lines = [
 		`brain: ${status.docs} notes · ${status.episodes} episodes · ${status.communities} clusters` +
-			` — \`brain recall "<q>"\`, \`brain path/explain/affected/map\``,
+			` — \`claude-brain recall "<q>"\`, \`claude-brain path/explain/affected/map\``,
 	];
 	for (const session of recentSessions(cwd, 2, sessionId)) {
 		if (!session.summary) continue;
