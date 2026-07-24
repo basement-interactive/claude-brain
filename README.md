@@ -85,6 +85,15 @@ claude-brain explain "<note>"      a note and everything around it
 claude-brain affected "<note>"     what points at it, transitively
 claude-brain map                   the vault as named clusters
 
+claude-brain design list                         what designs are stored
+claude-brain design add <path…> [--caption "…"]  save a design image
+claude-brain design show "<id or vibe>"          its description, then the image path
+
+claude-brain reorganize [--scope <folder>] [--dry-prompt] [--yes]
+                                   plan a folder structure; moves nothing
+claude-brain reorganize --apply [--plan <run-id>] [--yes]
+claude-brain reorganize --undo [<run-id>]
+
 claude-brain vault <path>          choose where your brain lives
 claude-brain sync setup <provider> connect dropbox | gdrive | mega
 claude-brain sync now              sync to the cloud now
@@ -128,8 +137,12 @@ episodic memory — is unaffected, because none of it uses an LLM at all.
 
 ## Privacy
 
-- No telemetry, no external calls. Embeddings, search, clustering and graph building
-  are fully local — there is no LLM in any pipeline and no API key to configure.
+- No telemetry. Embeddings, search, clustering and graph building are fully local and
+  involve no model at all.
+- The only thing that ever leaves your machine is what you explicitly enable above, and
+  it goes through your own `claude` CLI to Anthropic — the same place your Claude Code
+  sessions already go. Off by default. `claude-brain reorganize --dry-prompt` prints the
+  exact text that would be sent, without sending it.
 - Episodic memory is read from Claude Code's session logs already on your disk and
   stored only in the local index. It is never written into your vault and never synced.
 - Cloud sync is off until you connect an account; it targets only your own storage and
