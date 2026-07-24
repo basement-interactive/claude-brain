@@ -19,6 +19,13 @@ build() {
 	bun install --frozen-lockfile --production
 }
 
+check() {
+	cd "$pkgname-$pkgver"
+	# Only needs production deps (bun:test is built in, sqlite-vec is a runtime dep),
+	# so this still passes after build() prunes devDependencies.
+	bun test
+}
+
 package() {
 	cd "$pkgname-$pkgver"
 	local app="$pkgdir/usr/share/claude-brain"
