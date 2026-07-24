@@ -6,13 +6,13 @@ import { reindex } from "./indexer";
 export type { RecallHit };
 
 /** Hybrid recall over the vault. Returns the top-k most relevant note sections. */
-export async function recall(query: string, k = 6): Promise<RecallHit[]> {
-	return hybridRecall(query, k);
+export async function recall(query: string, k = 6, pathPrefix?: string): Promise<RecallHit[]> {
+	return hybridRecall(query, k, pathPrefix);
 }
 
 /** Compact markdown rendering for CLI / agent consumption. */
-export async function recallMarkdown(query: string, k = 6): Promise<string> {
-	const hits = await recall(query, k);
+export async function recallMarkdown(query: string, k = 6, pathPrefix?: string): Promise<string> {
+	const hits = await recall(query, k, pathPrefix);
 	if (hits.length === 0) return `No vault matches for: ${query}`;
 	return hits
 		.map(

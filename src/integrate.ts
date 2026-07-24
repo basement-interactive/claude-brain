@@ -51,12 +51,16 @@ Before ending a session with meaningful work, record into the vault (location:
 
 1. **Work log** — append-or-create \`Journal/YYYY-MM-DD.md\` with a short dated
    section: what was done, decisions made, open ends.
-2. **Solved bug / gotcha** — atomic note in \`Notes/\` named after the symptom:
-   Symptom / Root cause / Fix. Link related notes with \`[[wikilinks]]\`.
-3. **Quick capture** — \`claude-brain note "<text>"\` drops a thought into
-   \`Inbox/\` without opening an editor.
+2. **Solved bug / gotcha** — atomic note in \`Notes/<domain>/\` named after the
+   symptom: Symptom / Root cause / Fix. Link related notes with \`[[wikilinks]]\`.
+3. **Quick capture** — \`claude-brain note "<text>" [-f <subfolder>]\` drops a
+   thought into \`<subfolder>/\` (default \`Inbox/\`) without opening an editor.
 
 Rules:
+- **Organize into topical subfolders, never a flat dump** — file notes under a
+  domain folder (\`Notes/rust/\`, \`Notes/deploy/\`, …); create new domain folders
+  freely when none fits (3+ related notes deserve their own folder). Folder-scoped
+  lookup: \`claude-brain recall "<q>" -p "Notes/rust"\`.
 - Never edit or delete existing notes without asking. New notes are always fine.
 - Keep entries atomic and searchable — titles describe the symptom or topic.
 - The index updates itself; no reindex commands needed.

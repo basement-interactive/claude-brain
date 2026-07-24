@@ -1,6 +1,6 @@
 {
 	"name": "claude-brain",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "A local second brain for Claude Code: hybrid recall over your markdown vault, 3D knowledge graph, cloud sync.",
 	"license": "MIT",
 	"type": "module",

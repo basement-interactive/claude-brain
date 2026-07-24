@@ -96,13 +96,14 @@ const server = Bun.serve({
 		if (url.pathname === "/api/recall") {
 			const q = url.searchParams.get("q") ?? "";
 			const k = Number(url.searchParams.get("k") ?? "6") || 6;
+			const p = url.searchParams.get("p") ?? undefined;
 			if (!q.trim()) return jsonResponse({ error: "missing q" }, 400);
 			if (url.searchParams.get("format") === "md") {
-				return new Response(await recallMarkdown(q, k), {
+				return new Response(await recallMarkdown(q, k, p), {
 					headers: { "content-type": "text/plain; charset=utf-8" },
 				});
 			}
-			return jsonResponse({ query: q, hits: await recall(q, k) });
+			return jsonResponse({ query: q, hits: await recall(q, k, p) });
 		}
 
 		if (url.pathname === "/api/note") {

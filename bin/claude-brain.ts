@@ -54,14 +54,18 @@ async function cmdOpen(): Promise<void> {
 }
 
 async function cmdRecall(rest: string[]): Promise<void> {
+	let prefix: string | undefined;
+	const pIdx = rest.indexOf("-p");
+	if (pIdx !== -1) prefix = rest.splice(pIdx, 2)[1];
 	let k = 6;
 	if (rest.length > 1 && /^\d+$/.test(rest[rest.length - 1] ?? "")) k = Number(rest.pop());
 	const query = rest.join(" ").trim();
 	if (!query) {
-		console.error('claude-brain recall "<query>" [k]');
+		console.error('claude-brain recall "<query>" [k] [-p <folder-prefix>]');
 		process.exit(1);
 	}
-	const res = await api(`/api/recall?q=${encodeURIComponent(query)}&k=${k}&format=md`);
+	const pArg = prefix ? `&p=${encodeURIComponent(prefix)}` : "";
+	const res = await api(`/api/recall?q=${encodeURIComponent(query)}&k=${k}&format=md${pArg}`);
 	if (res) {
 		console.log(await res.text());
 		return;
@@ -71,9 +75,13 @@ async function cmdRecall(rest: string[]): Promise<void> {
 }
 
 async function cmdNote(rest: string[]): Promise<void> {
+	// Optional folder: `claude-brain note -f rust "text"` files under `<vault>/rust/`.
+	let folder = "Inbox";
+	const fIdx = rest.indexOf("-f");
+	if (fIdx !== -1) folder = rest.splice(fIdx, 2)[1] ?? "Inbox";
 	const text = rest.join(" ").trim();
 	if (!text) {
-		console.error('claude-brain note "<text>"');
+		console.error('claude-brain note "<text>" [-f <subfolder>]');
 		process.exit(1);
 	}
 	const { vaultReady, vaultRoot } = await import("../src/config");
@@ -83,7 +91,7 @@ async function cmdNote(rest: string[]): Promise<void> {
 		process.exit(1);
 	}
 	const stamp = new Date().toISOString().slice(0, 16).replace("T", " ").replace(":", "");
-	const dir = join(root, "Inbox");
+	const dir = join(root, folder.replace(/^\/+|\.\./g, ""));
 	mkdirSync(dir, { recursive: true });
 	let path = join(dir, `${stamp}.md`);
 	for (let i = 2; existsSync(path); i++) path = join(dir, `${stamp} (${i}).md`);
@@ -199,8 +207,8 @@ switch (cmd) {
 	default:
 		console.log(`usage:
   claude-brain                       open the brain UI
-  claude-brain recall "<query>" [k]  search your vault
-  claude-brain note "<text>"         quick-capture to the vault inbox
+  claude-brain recall "<query>" [k] [-p <folder>]  search your vault (folder-scoped with -p)
+  claude-brain note "<text>" [-f <subfolder>]      quick-capture (default Inbox/)
   claude-brain vault <path>          choose where your brain lives
   claude-brain sync setup <provider> connect dropbox | gdrive | mega
   claude-brain sync now              sync to the cloud now

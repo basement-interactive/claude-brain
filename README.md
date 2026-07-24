@@ -48,8 +48,8 @@ claude-brain sync setup dropbox   # or: gdrive, mega
 CLI reference:
 
 ```
-claude-brain recall "<query>" [k]  hybrid search over your vault
-claude-brain note "<text>"         quick-capture into the vault inbox
+claude-brain recall "<query>" [k] [-p <folder>]  hybrid search (folder-scoped with -p)
+claude-brain note "<text>" [-f <subfolder>]      quick-capture (default Inbox/)
 claude-brain vault <path>          choose where your brain lives
 claude-brain sync setup <provider> connect dropbox | gdrive | mega
 claude-brain sync now              sync to the cloud now

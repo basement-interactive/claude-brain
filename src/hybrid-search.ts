@@ -146,12 +146,17 @@ function poolByDoc(candidates: Candidate[]): Candidate[] {
 	}));
 }
 
-export async function hybridRecall(query: string, k = 6): Promise<RecallHit[]> {
+export async function hybridRecall(query: string, k = 6, pathPrefix?: string): Promise<RecallHit[]> {
 	const [lex, vec] = await Promise.all([
 		Promise.resolve(lexicalRanks(query)),
 		vectorRanks(query),
 	]);
-	const candidates = hydrate(fuse([lex, vec]));
+	let candidates = hydrate(fuse([lex, vec]));
+	// Folder-scoped recall: filter after fusion so global ranking stays comparable.
+	if (pathPrefix) {
+		const prefix = pathPrefix.replace(/^\/+|\/+$/g, "").toLowerCase();
+		candidates = candidates.filter((c) => c.path.toLowerCase().startsWith(prefix));
+	}
 	applyGraphBoost(candidates);
 	return poolByDoc(candidates)
 		.sort((a, b) => b.score - a.score)
