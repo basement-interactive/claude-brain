@@ -93,6 +93,27 @@ export function findRecurring(now = Date.now()): Recurrence[] {
 		.slice(0, MAX_PROPOSALS);
 }
 
+/**
+ * FTS and vector rows live in tables SQLite can't cascade from, so a crash between the
+ * satellite deletes and the row delete strands them. A stranded FTS row still matches a
+ * query and then hydrates to nothing — a silent hole in recall — so sweep them.
+ */
+function sweepOrphans(): void {
+	const { db, vectors } = openBrainDb();
+	db.run("DELETE FROM episodes_fts WHERE rowid NOT IN (SELECT id FROM episodes)");
+	db.run("DELETE FROM chunks_fts WHERE rowid NOT IN (SELECT id FROM chunks)");
+	if (!vectors) return;
+	// vec0 tables reject a correlated NOT IN, so collect first and delete by id.
+	const strandedEpisodes = (
+		db.query("SELECT episode_id AS id FROM vec_episodes").all() as Array<{ id: number }>
+	).filter(({ id }) => !db.query("SELECT 1 FROM episodes WHERE id = ?").get(id));
+	for (const { id } of strandedEpisodes) db.query("DELETE FROM vec_episodes WHERE episode_id = ?").run(id);
+	const strandedChunks = (
+		db.query("SELECT chunk_id AS id FROM vec_chunks").all() as Array<{ id: number }>
+	).filter(({ id }) => !db.query("SELECT 1 FROM chunks WHERE id = ?").get(id));
+	for (const { id } of strandedChunks) db.query("DELETE FROM vec_chunks WHERE chunk_id = ?").run(id);
+}
+
 export interface ConsolidationReport {
 	ingestedSessions: number;
 	ingestedEpisodes: number;
@@ -114,6 +135,7 @@ export function consolidate(sinceDays = 14): ConsolidationReport {
 	db.run("UPDATE sessions SET consolidated = 1 WHERE ended IS NOT NULL AND consolidated = 0");
 	// The injection ledger only guards a live context window; a week out it is dead weight.
 	db.query("DELETE FROM injected WHERE ts < ?").run(Date.now() - 7 * 86_400_000);
+	sweepOrphans();
 	// Autocheckpoint recycles WAL pages but never shrinks the file; embedding passes had
 	// left it at 5 MB. Truncating here is safe — the server is the only writer.
 	db.run("PRAGMA wal_checkpoint(TRUNCATE)");

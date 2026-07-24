@@ -301,14 +301,17 @@ export async function embedPending(): Promise<number> {
 			// qmd trick: prefix title into every embedded chunk for cheap relevance gain.
 			const vecs = await embedTexts(pending.map((p) => `${p.title} | ${p.heading} | ${p.text}`));
 			if (!vecs) return total;
+			// vec0 virtual tables don't honour OR REPLACE — it raises a UNIQUE violation
+			// instead of replacing. Delete first so a reused chunk rowid can't wedge the pass.
+			const clear = db.query("DELETE FROM vec_chunks WHERE chunk_id = ?");
+			const insert = db.query("INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)");
+			const mark = db.query("UPDATE chunks SET embedded = 1 WHERE id = ?");
 			db.transaction(() => {
 				for (let i = 0; i < pending.length; i++) {
 					const chunk = pending[i]!;
-					db.query("INSERT OR REPLACE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)").run(
-						chunk.id,
-						new Float32Array(vecs[i]!),
-					);
-					db.query("UPDATE chunks SET embedded = 1 WHERE id = ?").run(chunk.id);
+					clear.run(chunk.id);
+					insert.run(chunk.id, new Float32Array(vecs[i]!));
+					mark.run(chunk.id);
 				}
 			})();
 			total += pending.length;

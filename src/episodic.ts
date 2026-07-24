@@ -148,10 +148,15 @@ export async function embedPendingEpisodes(): Promise<number> {
 			if (pending.length === 0) return total;
 			const vecs = await embedTexts(pending.map((p) => `${p.kind} | ${p.text}`));
 			if (!vecs) return total;
-			const insert = db.query("INSERT OR REPLACE INTO vec_episodes (episode_id, embedding) VALUES (?, ?)");
+			// vec0 virtual tables don't honour OR REPLACE — it raises a UNIQUE violation
+			// instead of replacing. Delete first; a stale vector for a reused rowid would
+			// otherwise crash the whole embedding pass on startup.
+			const clear = db.query("DELETE FROM vec_episodes WHERE episode_id = ?");
+			const insert = db.query("INSERT INTO vec_episodes (episode_id, embedding) VALUES (?, ?)");
 			const mark = db.query("UPDATE episodes SET embedded = 1 WHERE id = ?");
 			db.transaction(() => {
 				for (let i = 0; i < pending.length; i++) {
+					clear.run(pending[i]!.id);
 					insert.run(pending[i]!.id, new Float32Array(vecs[i]!));
 					mark.run(pending[i]!.id);
 				}

@@ -7,29 +7,52 @@ import {
 	explainNode,
 	findPath,
 	type NodeRef,
-	resolveNode,
+	resolutionCandidates,
+	resolveWithConfidence,
 } from "./traverse";
 
 function label(node: NodeRef): string {
 	return `${node.title}  \`${node.path}\``;
 }
 
-async function resolveOrExplain(query: string): Promise<NodeRef | string> {
-	const node = await resolveNode(query);
-	return node ?? `No note matches: ${query}`;
+/**
+ * Resolve a described note, collecting any caveat the caller should print. A loose match
+ * is still used — refusing outright would reject good queries, since confident and vague
+ * descriptions overlap in score — but the reader is told what it settled on.
+ */
+async function resolveOrExplain(query: string): Promise<{ node: NodeRef; note: string } | string> {
+	const resolved = await resolveWithConfidence(query);
+	if (!resolved) {
+		const candidates = await resolutionCandidates(query);
+		if (candidates.length === 0) return `Nothing in the vault matches: "${query}"`;
+		return [
+			`"${query}" doesn't identify a note. Closest matches — name one directly:`,
+			...candidates.map((c) => `  · ${c.title}  \`${c.path}\``),
+		].join("\n");
+	}
+	if (!resolved.loose) return { node: resolved.node, note: "" };
+	const others = resolved.alternatives.map((c) => c.title).join(", ");
+	return {
+		node: resolved.node,
+		note: `note: "${query}" matched loosely → ${resolved.node.title}${others ? ` (also close: ${others})` : ""}`,
+	};
 }
 
 export async function renderPath(fromQuery: string, toQuery: string): Promise<string> {
-	const from = await resolveOrExplain(fromQuery);
-	if (typeof from === "string") return from;
-	const to = await resolveOrExplain(toQuery);
-	if (typeof to === "string") return to;
+	const fromResult = await resolveOrExplain(fromQuery);
+	if (typeof fromResult === "string") return fromResult;
+	const toResult = await resolveOrExplain(toQuery);
+	if (typeof toResult === "string") return toResult;
+	const { node: from } = fromResult;
+	const { node: to } = toResult;
 
 	const hops = findPath(from.id, to.id);
 	if (hops === null) return `No path between "${from.title}" and "${to.title}" — they sit in different parts of the vault.`;
 	if (hops.length === 0) return `Same note: ${label(from)}`;
 
-	const lines = [`${hops.length} hop${hops.length === 1 ? "" : "s"}: ${from.title} → ${to.title}`, ""];
+	const lines = [fromResult.note, toResult.note].filter(Boolean);
+	if (lines.length > 0) lines.push("");
+	lines.push(`${hops.length} hop${hops.length === 1 ? "" : "s"}: ${from.title} → ${to.title}`, "");
 	lines.push(`  ${from.title}`);
 	for (const hop of hops) {
 		const detail = hop.detail ? ` (${hop.detail})` : "";
@@ -41,12 +64,13 @@ export async function renderPath(fromQuery: string, toQuery: string): Promise<st
 }
 
 export async function renderExplain(query: string): Promise<string> {
-	const node = await resolveOrExplain(query);
-	if (typeof node === "string") return node;
-	const report = explainNode(node.id);
+	const resolved = await resolveOrExplain(query);
+	if (typeof resolved === "string") return resolved;
+	const report = explainNode(resolved.node.id);
 	if (!report) return `No note matches: ${query}`;
 
 	const lines = [
+		...(resolved.note ? [resolved.note, ""] : []),
 		`# ${report.node.title}`,
 		`\`${report.node.path}\``,
 		`community: ${report.community ? `${report.community.label} (${report.community.size} notes)` : "unclustered"}`,
@@ -71,11 +95,16 @@ export async function renderExplain(query: string): Promise<string> {
 }
 
 export async function renderAffected(query: string, depth: number): Promise<string> {
-	const node = await resolveOrExplain(query);
-	if (typeof node === "string") return node;
+	const resolved = await resolveOrExplain(query);
+	if (typeof resolved === "string") return resolved;
+	const { node } = resolved;
 	const hits = affected(node.id, depth);
 	if (hits.length === 0) return `Nothing points at ${node.title}.`;
-	const lines = [`${hits.length} reach ${node.title} (depth ≤ ${depth}, strongest first)`, ""];
+	const lines = [
+		...(resolved.note ? [resolved.note, ""] : []),
+		`${hits.length} reach ${node.title} (depth ≤ ${depth}, strongest first)`,
+		"",
+	];
 	for (const hit of hits) lines.push(`  ${"·".repeat(hit.depth)} ${hit.title}  [${hit.via}]`);
 	return lines.join("\n");
 }
@@ -86,7 +115,7 @@ export async function renderAffected(query: string, depth: number): Promise<stri
  */
 export function renderMap(withExamples = false): string {
 	const map = communityMap();
-	if (map.length === 0) return "No communities yet — run `brain reindex` first.";
+	if (map.length === 0) return "No communities yet — run `claude-brain reindex` first.";
 	const lines = [`${map.length} clusters across the vault`, ""];
 	for (const c of map) {
 		lines.push(`${String(c.size).padStart(3)}  ${c.label}`);

@@ -40,9 +40,54 @@ export async function resolveNode(query: string): Promise<NodeRef | null> {
 		.get(trimmed, `%${trimmed.replace(/\.md$/i, "")}.md`) as NodeRef | null;
 	if (byName) return byName;
 
-	const hits = await recall(trimmed, { k: 1, episodeK: 0, reinforce: false });
+	const hits = await recall(trimmed, { k: 3, episodeK: 0, reinforce: false });
 	const top = hits.find((h) => h.kind === "note");
-	return top ? docByExactPath(top.path) : null;
+	if (!top || top.score < RESOLVE_FLOOR) return null;
+	return docByExactPath(top.path);
+}
+
+/**
+ * Below this the ranker is returning its least-bad option for a description that names
+ * nothing ("the thing we discussed"), so refuse outright.
+ */
+const RESOLVE_FLOOR = 0.095;
+/**
+ * Above the floor but below this, the match is plausible and worth using — but the
+ * caller should be told, because a path through a misidentified node still looks like
+ * a path. Measured: confident descriptions land 0.136–0.207, vague ones 0.088–0.107,
+ * and the ranges overlap, so a hard cut in the overlap would reject good queries.
+ */
+const RESOLVE_CONFIDENT = 0.13;
+
+export interface Resolution {
+	node: NodeRef;
+	loose: boolean;
+	alternatives: NodeRef[];
+}
+
+/** Resolve with provenance: what matched, how sure, and what else was close. */
+export async function resolveWithConfidence(query: string): Promise<Resolution | null> {
+	const node = await resolveNode(query);
+	if (!node) return null;
+	const hits = await recall(query, { k: 3, episodeK: 0, reinforce: false });
+	const notes = hits.filter((h) => h.kind === "note");
+	const loose = (notes[0]?.score ?? 0) < RESOLVE_CONFIDENT;
+	const alternatives = loose
+		? notes
+				.slice(1)
+				.map((h) => docByExactPath(h.path))
+				.filter((n): n is NodeRef => n !== null)
+		: [];
+	return { node, loose, alternatives };
+}
+
+/** Best-effort alternatives, for telling the user what a failed description nearly matched. */
+export async function resolutionCandidates(query: string): Promise<NodeRef[]> {
+	const hits = await recall(query, { k: 3, episodeK: 0, reinforce: false });
+	return hits
+		.filter((h) => h.kind === "note")
+		.map((h) => docByExactPath(h.path))
+		.filter((n): n is NodeRef => n !== null);
 }
 
 export interface PathHop {
