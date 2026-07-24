@@ -158,6 +158,190 @@ async function cmdGraph(verb: string, rest: string[]): Promise<void> {
 	console.log((await res.text()).trimEnd());
 }
 
+function flag(rest: string[], name: string): boolean {
+	const i = rest.indexOf(name);
+	if (i === -1) return false;
+	rest.splice(i, 1);
+	return true;
+}
+
+function option(rest: string[], name: string): string | undefined {
+	const i = rest.indexOf(name);
+	return i === -1 ? undefined : rest.splice(i, 2)[1];
+}
+
+/** y/N on a TTY; off a TTY the caller must have passed --yes, so this returns false. */
+async function confirm(question: string): Promise<boolean> {
+	if (!process.stdin.isTTY) return false;
+	process.stdout.write(`${question} [y/N] `);
+	for await (const line of console) return /^y(es)?$/i.test(line.trim());
+	return false;
+}
+
+/**
+ * Reorganize the vault into a topical folder structure, using the user's own Claude CLI
+ * for the categorisation. Planning is free of consequence — it writes a run directory and
+ * moves nothing. Only `--apply` touches the vault, and `--undo` puts it back.
+ */
+async function cmdReorganize(rest: string[]): Promise<void> {
+	const { buildInventory, DEFAULT_MAX_NOTES } = await import("../src/reorganize-inventory");
+	const { createPlan, estimateCost, loadPlan, previewPrompts, renderPlan } = await import("../src/reorganize-plan");
+	const { applyPlan, listRuns, undoRun } = await import("../src/reorganize-apply");
+
+	if (flag(rest, "--list")) {
+		const runs = listRuns();
+		if (runs.length === 0) console.log("no reorganize runs yet");
+		for (const run of runs) console.log(JSON.stringify(run));
+		return;
+	}
+
+	if (flag(rest, "--undo")) {
+		const result = await undoRun(rest[0]);
+		console.log(JSON.stringify(result, null, 2));
+		process.exitCode = result.ok ? 0 : 1;
+		return;
+	}
+
+	const yes = flag(rest, "--yes");
+	const noReindex = flag(rest, "--no-reindex");
+
+	if (flag(rest, "--apply")) {
+		const loaded = loadPlan(option(rest, "--plan"));
+		if (!loaded) {
+			console.error("no plan found — run `claude-brain reorganize` first");
+			process.exit(1);
+		}
+		const selected = loaded.plan.moves.filter((m) => m.selected).length;
+		console.log(`plan ${loaded.plan.runId}: ${selected} move(s) from ${loaded.path}`);
+		if (!yes && !(await confirm(`Move ${selected} note(s)?`))) {
+			console.error("aborted — pass --yes to apply without a prompt");
+			process.exit(1);
+		}
+		const result = await applyPlan(loaded.plan, {
+			reindex: !noReindex,
+			onProgress: (m) => console.log(m),
+		});
+		console.log(JSON.stringify({ ...result, skipped: result.skipped.length }, null, 2));
+		process.exitCode = result.ok ? 0 : 1;
+		return;
+	}
+
+	const inv = buildInventory({
+		scope: option(rest, "--scope"),
+		max: Number(option(rest, "--max") ?? DEFAULT_MAX_NOTES) || DEFAULT_MAX_NOTES,
+		includeRoot: flag(rest, "--include-root"),
+		freeze: (option(rest, "--freeze") ?? "").split(",").filter(Boolean),
+	});
+	if (!inv.ok) {
+		console.error(inv.message);
+		process.exit(1);
+	}
+
+	const opts = {
+		batch: Number(option(rest, "--batch") ?? "") || undefined,
+		folders: Number(option(rest, "--folders") ?? "") || undefined,
+		model: option(rest, "--model") as "haiku" | "sonnet" | "opus" | undefined,
+		taxonomyFile: option(rest, "--taxonomy"),
+		allowChurn: flag(rest, "--allow-churn"),
+		onProgress: (m: string) => console.log(m),
+	};
+
+	// Free auditability: exactly what would be sent to the user's own CLI, without
+	// sending it. Worth having when the input is somebody's private notes.
+	if (flag(rest, "--dry-prompt")) {
+		for (const prompt of previewPrompts(inv.inventory, opts)) console.log(`${prompt}\n${"-".repeat(72)}`);
+		return;
+	}
+
+	const cost = estimateCost(inv.inventory, opts);
+	console.log(`${inv.inventory.notes.length} candidate note(s), estimated ${cost.calls} call(s) ≈ $${cost.usd.toFixed(3)}`);
+	if (!yes && !(await confirm("Send titles, tags and note openings to your Claude CLI?"))) {
+		console.error("aborted — pass --yes to plan without a prompt");
+		process.exit(1);
+	}
+
+	const planned = await createPlan(inv.inventory, opts);
+	if (!planned.ok) {
+		console.error(planned.message);
+		process.exit(1);
+	}
+	console.log(renderPlan(planned.plan));
+	console.log(`\nplan written to ${planned.planPath}`);
+	console.log(`apply with:  claude-brain reorganize --apply --plan ${planned.plan.runId}`);
+}
+
+/** The design library: what the brain remembers about designs the user liked. */
+async function cmdDesign(rest: string[]): Promise<void> {
+	const store = await import("../src/design-store");
+	const sub = rest.shift() ?? "list";
+
+	if (sub === "list") {
+		const rows = store.listDesigns({ all: flag(rest, "--all") });
+		if (rows.length === 0) console.log("no designs yet — upload one in the dashboard, or `claude-brain design add <path>`");
+		for (const row of rows) {
+			console.log(`${row.id}  ${row.status.padEnd(12)}  ${row.name || row.source_name}${row.note_path ? `  -> ${row.note_path}` : ""}`);
+		}
+		return;
+	}
+
+	if (sub === "add") {
+		const caption = option(rest, "--caption");
+		const { enqueueDesign } = await import("../src/design-extract");
+		for (const path of rest) {
+			const bytes = new Uint8Array(await Bun.file(path).arrayBuffer());
+			const result = await store.saveDesign({ bytes, sourceName: path.split("/").pop() ?? path, caption });
+			if (!result.ok) {
+				console.error(`${path}: ${result.reason}`);
+				process.exitCode = 1;
+				continue;
+			}
+			if (result.fresh || result.requeued) enqueueDesign(result.row.id);
+			console.log(`${result.row.id}  ${result.fresh ? "added" : result.requeued ? "re-queued" : "already known"}  ${path}`);
+		}
+		return;
+	}
+
+	// Everything below addresses one design, by id or by description.
+	const query = rest.filter((a) => !a.startsWith("-")).join(" ").trim();
+	const row = store.validId(query) ? store.getDesign(query) : (store.findDesigns(query, 1)[0] ?? null);
+	if (!row) {
+		console.error(query ? `no design matches: ${query}` : `claude-brain design ${sub} "<id or description>"`);
+		process.exit(1);
+	}
+
+	if (sub === "show") {
+		const { designBrief } = await import("../src/design-note");
+		console.log(designBrief([row]));
+		// The escape hatch: the brief gets an agent most of the way, and it can Read the
+		// image itself for whatever the words did not carry.
+		console.log(`\nimage: ${store.imagePath(row)}`);
+		if (row.note_path) console.log(`note:  ${row.note_path}`);
+		return;
+	}
+	if (sub === "retry") {
+		const { retryExtraction } = await import("../src/design-extract");
+		console.log(retryExtraction(row.id) ? `re-queued ${row.id}` : `could not re-queue ${row.id}`);
+		return;
+	}
+	if (sub === "restore") {
+		const { restoreDesignNote } = await import("../src/design-extract");
+		const result = restoreDesignNote(row.id);
+		console.log(result.detail);
+		process.exitCode = result.ok ? 0 : 1;
+		return;
+	}
+	if (sub === "forget") {
+		const trashNote = flag(rest, "--trash-note");
+		const confirmed = flag(rest, "--yes");
+		const plan = store.forgetDesign(row.id, { confirm: confirmed, trashNote });
+		console.log(JSON.stringify(plan, null, 2));
+		if (!confirmed) console.log("\ndry run — repeat with --yes to actually free the bytes");
+		return;
+	}
+	console.error(`unknown: design ${sub}`);
+	process.exit(1);
+}
+
 async function cmdConsolidate(rest: string[]): Promise<void> {
 	const days = Number(rest[0] ?? "30") || 30;
 	const res = await postJson(`/api/consolidate?days=${days}`, {});
@@ -332,6 +516,12 @@ switch (cmd) {
 	case "map":
 		await cmdGraph(cmd, rest);
 		break;
+	case "reorganize":
+		await cmdReorganize(rest);
+		break;
+	case "design":
+		await cmdDesign(rest);
+		break;
 	case "consolidate":
 		await cmdConsolidate(rest);
 		break;
@@ -372,6 +562,19 @@ switch (cmd) {
   claude-brain explain "<note>"      a note and everything around it
   claude-brain affected "<note>" [-d N]   what points at it, transitively
   claude-brain map                   the vault as named clusters
+
+ designs — reference images the brain can describe back to you
+  claude-brain design list [--all]
+  claude-brain design add <path…> [--caption "…"]
+  claude-brain design show "<id or description>"   the description, then the image path
+  claude-brain design retry|restore|forget "<id or description>"
+
+ reorganize — tidy the vault into topical folders (uses your own claude CLI)
+  claude-brain reorganize [--scope <folder>] [--max n] [--dry-prompt] [--yes]
+                                     plans only; writes a plan file, moves nothing
+  claude-brain reorganize --apply [--plan <run-id>] [--yes]
+  claude-brain reorganize --undo [<run-id>]
+  claude-brain reorganize --list
 
  upkeep
   claude-brain vault <path>          choose where your brain lives

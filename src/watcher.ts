@@ -2,12 +2,14 @@
 // unmount/switch by polling for the directory until it is usable again.
 
 import { watch, type FSWatcher } from "node:fs";
-import { IGNORED_DIR_NAMES, vaultReady, vaultRoot } from "./config";
+import { IGNORED_DIR_NAMES, reorganizeLockHeld, vaultReady, vaultRoot } from "./config";
 import { reindex } from "./indexer";
 import { scheduleChangeSync } from "./sync";
 
 const DEBOUNCE_MS = 1_500;
 const RETRY_POLL_MS = 30_000;
+/** How often to re-check while a reorganize holds the lock. */
+const LOCKED_POLL_MS = 5_000;
 
 let watcher: FSWatcher | null = null;
 let timer: ReturnType<typeof setTimeout> | null = null;
@@ -21,17 +23,32 @@ function relevant(filename: string | null): boolean {
 	return !filename.split("/").some((p) => IGNORED_DIR_NAMES.has(p));
 }
 
-function scheduleReindex(): void {
+let waitingOnReorganize = false;
+
+function scheduleReindex(delayMs = DEBOUNCE_MS): void {
 	if (timer) clearTimeout(timer);
 	timer = setTimeout(() => {
 		timer = null;
+		// An apply pass emits thousands of events and rewrites paths as it goes; indexing
+		// the half-moved vault is pure churn, so wait it out rather than drop the events.
+		if (reorganizeLockHeld()) {
+			if (!waitingOnReorganize) {
+				waitingOnReorganize = true;
+				console.log("[watch] reorganize in progress — indexing paused");
+			}
+			scheduleReindex(LOCKED_POLL_MS);
+			return;
+		}
+		waitingOnReorganize = false;
 		void reindex().then((s) => {
-			if (s.indexed || s.updated || s.removed) {
-				console.log(`[watch] reindexed: +${s.indexed} ~${s.updated} -${s.removed} (${s.docs} docs, ${s.chunks} chunks)`);
+			if (s.indexed || s.updated || s.removed || s.moved) {
+				console.log(
+					`[watch] reindexed: +${s.indexed} ~${s.updated} -${s.removed} →${s.moved} (${s.docs} docs, ${s.chunks} chunks)`,
+				);
 				scheduleChangeSync();
 			}
 		});
-	}, DEBOUNCE_MS);
+	}, delayMs);
 }
 
 export function startWatcher(): void {

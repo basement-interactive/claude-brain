@@ -92,19 +92,48 @@ function ftsQuery(query: string, mode: "and" | "or"): string {
 	return terms.join(mode === "and" ? " " : " OR ");
 }
 
+/**
+ * Folder scoping belongs in SQL, not after fusion. Both rankers return a global top-30,
+ * so filtering the fused result means a scoped query over a large vault returns nothing
+ * at all unless the folder also happens to win globally — it works on a toy vault and
+ * silently dies on a real one.
+ *
+ * `path` is the docs column; LIKE is case-insensitive for ASCII, matching the old
+ * lowercase comparison, and the prefix is escaped because a folder may legitimately
+ * contain `_`.
+ */
+function normalizePrefix(prefix: string): string {
+	return prefix.replace(/^\/+|\/+$/g, "").toLowerCase();
+}
+
+function likePrefix(prefix: string): string {
+	return `${prefix.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+}
+
 /** BM25 over one FTS table. Falls back from all-terms to any-term when too few match. */
-function lexicalRanks(table: string, columnWeights: number[], query: string): Map<number, number> {
+function lexicalRanks(
+	table: string,
+	columnWeights: number[],
+	query: string,
+	pathPrefix?: string,
+): Map<number, number> {
 	const { db } = openBrainDb();
 	const weights = columnWeights.join(", ");
+	// Only chunks rows have a doc, and therefore a path, to scope by.
+	const scoped = pathPrefix !== undefined && table === "chunks_fts";
+	const sql = scoped
+		? `SELECT f.rowid AS rowid, bm25(chunks_fts, ${weights}) AS s
+			 FROM chunks_fts f
+			 JOIN chunks c ON c.id = f.rowid
+			 JOIN docs d ON d.id = c.doc_id
+			 WHERE chunks_fts MATCH ? AND d.path LIKE ? ESCAPE '\\' ORDER BY s LIMIT ?`
+		: `SELECT rowid, bm25(${table}, ${weights}) AS s
+			 FROM ${table} WHERE ${table} MATCH ? ORDER BY s LIMIT ?`;
 	const search = (match: string) => {
 		if (!match) return [];
 		try {
-			return db
-				.query(
-					`SELECT rowid, bm25(${table}, ${weights}) AS s
-					 FROM ${table} WHERE ${table} MATCH ? ORDER BY s LIMIT ?`,
-				)
-				.all(match, CANDIDATES) as Array<{ rowid: number }>;
+			const params = scoped ? [match, likePrefix(pathPrefix!), CANDIDATES] : [match, CANDIDATES];
+			return db.query(sql).all(...params) as Array<{ rowid: number }>;
 		} catch {
 			return [];
 		}
@@ -119,14 +148,38 @@ function lexicalRanks(table: string, columnWeights: number[], query: string): Ma
 	return ranks;
 }
 
-function vectorRanks(table: string, idColumn: string, vector: number[] | null): Map<number, number> {
+function vectorRanks(
+	table: string,
+	idColumn: string,
+	vector: number[] | null,
+	pathPrefix?: string,
+): Map<number, number> {
 	const { db, vectors } = openBrainDb();
 	const ranks = new Map<number, number>();
 	if (!vectors || !vector) return ranks;
+	// vec0 KNN has no cheap pre-filter, so a scoped query over-fetches and drops the
+	// chunks that fell outside the folder. The multiplier is what makes a small folder
+	// in a large vault still fill a candidate list.
+	const scoped = pathPrefix !== undefined && table === "vec_chunks";
 	const rows = db
 		.query(`SELECT ${idColumn} AS id FROM ${table} WHERE embedding MATCH ? AND k = ? ORDER BY distance`)
-		.all(new Float32Array(vector), CANDIDATES) as Array<{ id: number }>;
-	rows.forEach((r, i) => ranks.set(r.id, i));
+		.all(new Float32Array(vector), scoped ? CANDIDATES * 8 : CANDIDATES) as Array<{ id: number }>;
+
+	let ids = rows.map((r) => r.id);
+	if (scoped && ids.length > 0) {
+		const inScope = new Set(
+			(
+				db
+					.query(
+						`SELECT c.id AS id FROM chunks c JOIN docs d ON d.id = c.doc_id
+						 WHERE c.id IN (${ids.map(() => "?").join(",")}) AND d.path LIKE ? ESCAPE '\\'`,
+					)
+					.all(...ids, likePrefix(pathPrefix!)) as Array<{ id: number }>
+			).map((r) => r.id),
+		);
+		ids = ids.filter((id) => inScope.has(id)).slice(0, CANDIDATES);
+	}
+	ids.forEach((id, i) => ranks.set(id, i));
 	return ranks;
 }
 
@@ -326,16 +379,15 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 	const episodeK = options.episodeK ?? Math.max(1, Math.round(k / 3));
 	const vector = primeQuery(options.sessionId, await embedQuery(query));
 
+	const prefix = options.pathPrefix ? normalizePrefix(options.pathPrefix) : undefined;
 	const noteFused = fuse([
-		lexicalRanks("chunks_fts", [3.0, 2.0, 1.0], query),
-		vectorRanks("vec_chunks", "chunk_id", vector),
+		lexicalRanks("chunks_fts", [3.0, 2.0, 1.0], query, prefix),
+		vectorRanks("vec_chunks", "chunk_id", vector, prefix),
 	]);
 	let notes = hydrateChunks(noteFused);
-	// Folder-scoped recall filters after fusion so global ranking stays comparable.
-	if (options.pathPrefix) {
-		const prefix = options.pathPrefix.replace(/^\/+|\/+$/g, "").toLowerCase();
-		notes = notes.filter((c) => c.path.toLowerCase().startsWith(prefix));
-	}
+	// Safety net only: both rankers already scoped in SQL, so this is a no-op unless a
+	// path changed between the ranking queries and hydration.
+	if (prefix) notes = notes.filter((c) => c.path.toLowerCase().startsWith(prefix));
 	applyGraphBoost(notes);
 	const pooled = poolByDoc(notes).sort((a, b) => b.score - a.score);
 	const topNotes = addAssociations(pooled.slice(0, k), Math.max(1, Math.round(k / 4)))

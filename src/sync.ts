@@ -9,6 +9,7 @@ import { join } from "node:path";
 import {
 	STATE_DIR,
 	loadConfig,
+	reorganizeLockHeld,
 	saveConfig,
 	vaultReady,
 	vaultRoot,
@@ -83,6 +84,12 @@ export async function syncNow(reason: string): Promise<boolean> {
 	const root = vaultRoot();
 	if (!root || !vaultReady()) {
 		log(`skip (${reason}): vault not available`);
+		return false;
+	}
+	// Every move is a delete plus an upload to rclone. Mirroring a half-moved vault
+	// pushes thousands of now-stale paths into the dated remote trash for nothing.
+	if (reorganizeLockHeld()) {
+		log(`skip (${reason}): reorganize in progress`);
 		return false;
 	}
 	if (!(await remoteConfigured(provider))) {

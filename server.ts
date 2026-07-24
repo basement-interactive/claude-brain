@@ -10,7 +10,20 @@ import {
 	vaultRoot,
 	type SyncProvider,
 } from "./src/config";
+import { status as claudeStatus } from "./src/claude-cli";
 import { consolidate } from "./src/consolidate";
+import { enqueueDesign, restoreDesignNote, resumeExtractions, retryExtraction } from "./src/design-extract";
+import {
+	forgetDesign,
+	getDesign,
+	imagePath,
+	listDesigns,
+	MAX_DESIGN_BYTES,
+	saveDesign,
+	sweepPartFiles,
+	thumbPath,
+	validId,
+} from "./src/design-store";
 import { embedPendingEpisodes, recordEpisode } from "./src/episodic";
 import { rebuildGraph } from "./src/graph";
 import { buildGraph } from "./src/graph-builder";
@@ -35,6 +48,26 @@ const MIME: Record<string, string> = {
 	".svg": "image/svg+xml",
 	".json": "application/json; charset=utf-8",
 };
+
+const ALLOWED_ORIGINS = new Set([
+	`http://localhost:${PORT}`,
+	`http://127.0.0.1:${PORT}`,
+	`http://[::1]:${PORT}`,
+]);
+
+/**
+ * Every POST here writes into the user's vault, repoints the vault itself, or spends
+ * their Claude quota. multipart/form-data and text/plain are CORS-simple, so no preflight
+ * protects them: any page the user happens to be visiting can reach this port by guessing
+ * it. Sec-Fetch-Site is sent by every current browser; the CLI's own fetch sends neither
+ * header, which is why absent means allowed.
+ */
+function sameOrigin(req: Request): boolean {
+	const site = req.headers.get("sec-fetch-site");
+	if (site && site !== "same-origin" && site !== "none") return false;
+	const origin = req.headers.get("origin");
+	return !origin || ALLOWED_ORIGINS.has(origin);
+}
 
 function jsonResponse(data: unknown, status = 200): Response {
 	return new Response(JSON.stringify(data), {
@@ -105,6 +138,88 @@ async function handleSession(action: string, payload: unknown): Promise<Response
 	return jsonResponse({ error: `unknown session action: ${action}` }, 404);
 }
 
+function blobResponse(path: string, mime: string): Response {
+	const file = Bun.file(path);
+	// Blobs are content-addressed by id, so a hit can be cached hard; the dashboard
+	// re-fetches by id when the id changes.
+	return new Response(file, {
+		headers: { "content-type": mime, "cache-control": "private, max-age=31536000, immutable" },
+	});
+}
+
+/**
+ * Design library. The only endpoints in the package that accept a file upload, so the
+ * size ceiling and the magic-byte check both live behind saveDesign() rather than being
+ * re-implemented per caller.
+ */
+async function handleDesigns(url: URL, req: Request, post: boolean): Promise<Response> {
+	const rest = url.pathname.slice("/api/designs".length).replace(/^\//, "");
+
+	if (!rest) {
+		if (!post) {
+			const status = await claudeStatus();
+			return jsonResponse({
+				designs: listDesigns({ all: url.searchParams.has("all") }),
+				llm: { available: status.available, reason: status.reason ?? null, enabled: loadConfig().llm.enabled },
+			});
+		}
+		const form = await req.formData();
+		const file = form.get("file");
+		if (!(file instanceof Blob)) return jsonResponse({ ok: false, reason: "no-file" }, 400);
+		if (file.size > MAX_DESIGN_BYTES) return jsonResponse({ ok: false, reason: "too-large" }, 413);
+
+		type FormValue = Blob | string | null;
+		const asBytes = async (v: FormValue) =>
+			v instanceof Blob ? new Uint8Array(await v.arrayBuffer()) : undefined;
+		const num = (v: FormValue) => (typeof v === "string" && v ? Number(v) || undefined : undefined);
+		const result = await saveDesign({
+			bytes: new Uint8Array(await file.arrayBuffer()),
+			sourceName: (file instanceof File ? file.name : "") || String(form.get("sourceName") ?? "upload"),
+			caption: typeof form.get("caption") === "string" ? String(form.get("caption")) : undefined,
+			width: num(form.get("width")),
+			height: num(form.get("height")),
+			thumb: await asBytes(form.get("thumb")),
+			render: await asBytes(form.get("render")),
+		});
+		if (!result.ok) return jsonResponse(result, result.reason === "too-large" ? 413 : 415);
+		if (result.fresh || result.requeued) enqueueDesign(result.row.id);
+		return jsonResponse(result);
+	}
+
+	const [id, action] = rest.split("/");
+	if (!id || !validId(id)) return jsonResponse({ error: "bad id" }, 400);
+	const row = getDesign(id);
+	if (!row) return jsonResponse({ error: "no such design" }, 404);
+
+	if (!post) {
+		if (action === "image") return blobResponse(imagePath(row), row.mime);
+		if (action === "thumb") {
+			if (!row.thumb) return jsonResponse({ error: "no thumbnail" }, 404);
+			return blobResponse(thumbPath(id), "image/webp");
+		}
+		if (!action) {
+			let spec: unknown = null;
+			try {
+				spec = row.spec ? JSON.parse(row.spec) : null;
+			} catch {
+				// Provenance is frozen text; a malformed blob must not take the row down with it.
+			}
+			return jsonResponse({ row, spec });
+		}
+		return jsonResponse({ error: `unknown design action: ${action}` }, 404);
+	}
+
+	if (action === "retry") return jsonResponse({ ok: retryExtraction(id) });
+	if (action === "restore") return jsonResponse(restoreDesignNote(id));
+	if (action === "forget") {
+		const body = (await req.json().catch(() => ({}))) as { confirm?: boolean; trashNote?: boolean };
+		// Dry-run unless the caller explicitly confirms: the plan tells the dashboard
+		// exactly what would be removed so the user can see it before agreeing.
+		return jsonResponse(forgetDesign(id, { confirm: body.confirm === true, trashNote: body.trashNote === true }));
+	}
+	return jsonResponse({ error: `unknown design action: ${action}` }, 404);
+}
+
 /** Switch vaults: validate, persist, wipe the old corpus index, rebuild, re-watch. */
 async function switchVault(path: string): Promise<Response> {
 	try {
@@ -127,6 +242,7 @@ const server = Bun.serve({
 	async fetch(req) {
 		const url = new URL(req.url);
 		const post = req.method === "POST";
+		if (post && !sameOrigin(req)) return jsonResponse({ error: "cross-origin request rejected" }, 403);
 
 		if (url.pathname === "/") return serveStatic("index.html");
 		if (url.pathname === "/bundle.js") return serveStatic("bundle.js");
@@ -202,6 +318,10 @@ const server = Bun.serve({
 			}
 		}
 
+		if (url.pathname === "/api/designs" || url.pathname.startsWith("/api/designs/")) {
+			return handleDesigns(url, req, post);
+		}
+
 		if (url.pathname === "/api/status") return jsonResponse(await fullStatus());
 		if (url.pathname === "/api/reindex" && post) return jsonResponse(await reindex());
 		if (url.pathname === "/api/vaults") return jsonResponse({ vaults: detectVaults() });
@@ -241,6 +361,12 @@ startSyncSchedule();
 // Drain any episodes captured while the server was down, then keep consolidating in
 // the background so a long-running daemon doesn't accumulate unabstracted history.
 void embedPendingEpisodes();
+
+// Designs interrupted mid-flight: reclaim expired extraction leases and clear scratch
+// files a killed run left behind. Both are no-ops on a clean start.
+const reclaimed = resumeExtractions();
+const swept = sweepPartFiles();
+if (reclaimed > 0 || swept > 0) console.log(`[designs] resumed ${reclaimed}, cleared ${swept} partial file(s)`);
 const CONSOLIDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 setInterval(() => {
 	const report = consolidate(3);

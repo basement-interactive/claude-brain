@@ -47,6 +47,7 @@ export function openBrainDb(path?: string): BrainDb {
 
 	createSemanticTables(db, vectors);
 	createEpisodicTables(db, vectors);
+	createDesignTables(db);
 	migrate(db);
 
 	opened = { db, vectors };
@@ -179,6 +180,47 @@ function createEpisodicTables(db: Database, vectors: boolean): void {
 	)`);
 }
 
+/**
+ * Design images: the bytes and their provenance. There is deliberately no FTS or vec
+ * table here — a design's searchable text is the note written into the vault, and a
+ * second copy would mean two rankings of the same memory, plus a second thing to keep
+ * in step with the user's edits. `spec` is frozen provenance (what the model actually
+ * said); the vault note is live and a user edit always wins.
+ *
+ * `next_attempt_at` is a column rather than a live timer so a restart mid-backoff does
+ * not lose the retry.
+ */
+function createDesignTables(db: Database): void {
+	db.run(`CREATE TABLE IF NOT EXISTS designs (
+		id TEXT PRIMARY KEY,
+		vault TEXT NOT NULL DEFAULT '',
+		note_path TEXT NOT NULL DEFAULT '',
+		note_missing INTEGER NOT NULL DEFAULT 0,
+		name TEXT NOT NULL DEFAULT '',
+		caption TEXT NOT NULL DEFAULT '',
+		source_name TEXT NOT NULL,
+		mime TEXT NOT NULL,
+		bytes INTEGER NOT NULL,
+		width INTEGER NOT NULL DEFAULT 0,
+		height INTEGER NOT NULL DEFAULT 0,
+		thumb INTEGER NOT NULL DEFAULT 0,
+		render INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'queued',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		next_attempt_at INTEGER NOT NULL DEFAULT 0,
+		error TEXT NOT NULL DEFAULT '',
+		spec TEXT NOT NULL DEFAULT '',
+		palette TEXT NOT NULL DEFAULT '[]',
+		mood TEXT NOT NULL DEFAULT '',
+		created INTEGER NOT NULL,
+		extracted INTEGER NOT NULL DEFAULT 0
+	)`);
+	// Every entry point (server, CLI, all three hooks) calls openBrainDb, so a bare
+	// CREATE INDEX here would throw "already exists" on the second run and brick the
+	// install for everyone.
+	db.run("CREATE INDEX IF NOT EXISTS designs_status ON designs(status, created DESC)");
+}
+
 /** Additive column adds for indexes written before a given feature existed. */
 function migrate(db: Database): void {
 	const columns = (table: string) =>
@@ -196,7 +238,10 @@ function migrate(db: Database): void {
 /**
  * Wipe everything derived from the vault, so switching vaults can't leave the previous
  * one's notes in the index. Episodes and sessions deliberately survive: they record what
- * you did, which stays true regardless of which vault is mounted.
+ * you did, which stays true regardless of which vault is mounted. Designs survive for the
+ * same reason — the image and what the model saw in it are facts about an upload, not
+ * about whichever vault happens to be mounted; each row carries the vault it was filed
+ * into, so a switch back finds its notes again.
  */
 export function resetIndex(): void {
 	const { db, vectors } = openBrainDb();

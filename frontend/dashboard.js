@@ -1,14 +1,19 @@
 import { createBrainTab } from "./brain.js";
+import { createDesignsTab } from "./designs.js";
 import { createSettingsTab } from "./settings.js";
 
 // Tab registry. Controllers are created lazily on first activation.
 const TABS = [
 	{ id: "brain", label: "Brain", make: createBrainTab, icon: iconBrain },
+	{ id: "designs", label: "Designs", make: createDesignsTab, icon: iconDesigns },
 	{ id: "settings", label: "Settings", make: createSettingsTab, icon: iconSettings },
 ];
 
 function iconBrain() {
 	return '<svg viewBox="0 0 22 22" fill="none"><circle cx="6" cy="7" r="2.3" stroke="currentColor" stroke-width="1.4"/><circle cx="15.5" cy="5.5" r="1.8" stroke="currentColor" stroke-width="1.4"/><circle cx="14" cy="15" r="2.1" stroke="currentColor" stroke-width="1.4"/><circle cx="6.5" cy="15.5" r="1.6" stroke="currentColor" stroke-width="1.4"/><path d="M8 8l6 6M8 7.5l6-1.4M8.2 14l4.6 1" stroke="currentColor" stroke-width="1.2" opacity=".7"/></svg>';
+}
+function iconDesigns() {
+	return '<svg viewBox="0 0 22 22" fill="none"><rect x="3" y="4" width="16" height="12" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M3 13l3.6-3.2a1.4 1.4 0 0 1 1.9 0L12 13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="14.4" cy="8.4" r="1.5" stroke="currentColor" stroke-width="1.3"/><path d="M7 19h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" opacity=".6"/></svg>';
 }
 function iconSettings() {
 	return '<svg viewBox="0 0 22 22" fill="none"><circle cx="11" cy="11" r="3" stroke="currentColor" stroke-width="1.4"/><path d="M11 2.8v2.4M11 16.8v2.4M19.2 11h-2.4M5.2 11H2.8M16.8 5.2l-1.7 1.7M6.9 15.1l-1.7 1.7M16.8 16.8l-1.7-1.7M6.9 6.9L5.2 5.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';

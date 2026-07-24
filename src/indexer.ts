@@ -16,6 +16,8 @@ export interface IndexStats {
 	indexed: number;
 	updated: number;
 	removed: number;
+	/** Notes that only changed location — same bytes, new path. */
+	moved: number;
 	unchanged: number;
 	docs: number;
 	chunks: number;
@@ -24,6 +26,13 @@ export interface IndexStats {
 
 interface VaultFile {
 	relPath: string;
+	mtime: number;
+	size: number;
+}
+
+interface KnownDoc {
+	id: number;
+	hash: string;
 	mtime: number;
 	size: number;
 }
@@ -55,6 +64,83 @@ function walkVault(root: string, dir: string, out: VaultFile[]): void {
 	}
 }
 
+/**
+ * Recognise moved notes before the diff turns them into deletes plus inserts.
+ *
+ * A reorganize — or one Obsidian drag-and-drop — otherwise costs every moved note its
+ * chunks, and with them its embeddings, its community and its derived links, forcing a
+ * full local re-embed of files whose bytes never changed.
+ *
+ * A move is only claimed on a true bijection: exactly one departure and exactly one
+ * arrival sharing a content hash. Three identical stubs moved out of one folder carry no
+ * fact about which became which, and guessing would repoint one docs row at several
+ * notes while leaving the rest with no row, no chunks and no way to be recalled.
+ *
+ * Reconciled files then take the unchanged fast path in the main loop, since their
+ * content genuinely did not change.
+ */
+function reconcileMoves(
+	root: string,
+	files: VaultFile[],
+	known: Map<string, KnownDoc>,
+	raws: Map<string, string>,
+	stats: IndexStats,
+): void {
+	const walked = new Set(files.map((f) => f.relPath));
+	const goneByHash = new Map<string, string[]>();
+	for (const [path, row] of known) {
+		if (walked.has(path)) continue;
+		const list = goneByHash.get(row.hash) ?? [];
+		list.push(path);
+		goneByHash.set(row.hash, list);
+	}
+	if (goneByHash.size === 0) return;
+
+	const freshByHash = new Map<string, VaultFile[]>();
+	for (const f of files) {
+		if (known.has(f.relPath)) continue;
+		let raw: string;
+		try {
+			raw = readFileSync(join(root, f.relPath), "utf-8");
+		} catch {
+			continue;
+		}
+		// Cached so the main loop does not read every new file a second time.
+		raws.set(f.relPath, raw);
+		const hash = String(Bun.hash(raw));
+		const list = freshByHash.get(hash) ?? [];
+		list.push(f);
+		freshByHash.set(hash, list);
+	}
+
+	const { db } = openBrainDb();
+	const update = db.query("UPDATE docs SET path = ?, title = ?, mtime = ?, size = ? WHERE id = ?");
+	const retitle = db.query("UPDATE chunks_fts SET title = ? WHERE rowid IN (SELECT id FROM chunks WHERE doc_id = ?)");
+
+	for (const [hash, arrivals] of freshByHash) {
+		const departures = goneByHash.get(hash);
+		if (!departures || departures.length !== 1 || arrivals.length !== 1) continue;
+		const from = departures[0]!;
+		const to = arrivals[0]!;
+		const prev = known.get(from)!;
+		const raw = raws.get(to.relPath) ?? "";
+		const title = titleOf(stripFrontmatter(raw), basename(to.relPath).replace(/\.md$/i, ""));
+		try {
+			update.run(to.relPath, title, to.mtime, to.size, prev.id);
+		} catch {
+			// docs.path is UNIQUE, so a collision means this was not the move it looked
+			// like. Leave the row alone and let the ordinary delete/insert path handle it.
+			continue;
+		}
+		// A rename keeps the bytes but can change the filename-derived title, and the FTS
+		// copy of it would otherwise stay stale until the note is edited.
+		if (basename(from) !== basename(to.relPath)) retitle.run(title, prev.id);
+		known.delete(from);
+		known.set(to.relPath, { id: prev.id, hash: prev.hash, mtime: to.mtime, size: to.size });
+		stats.moved++;
+	}
+}
+
 let running: Promise<IndexStats> | null = null;
 
 /** Serialized entry point — concurrent calls (watcher + API) share one pass. */
@@ -78,26 +164,25 @@ async function runReindex(): Promise<IndexStats> {
 	const root = vaultRoot();
 	if (!root || !vaultReady()) {
 		// Unset or unmounted vault: an empty walk must not wipe the last good index.
-		return { indexed: 0, updated: 0, removed: 0, unchanged: 0, ...countStats(), skipped: "vault not available" };
+		return { indexed: 0, updated: 0, removed: 0, moved: 0, unchanged: 0, ...countStats(), skipped: "vault not available" };
 	}
 
 	const files: VaultFile[] = [];
 	walkVault(root, root, files);
 
-	const known = new Map<string, { id: number; hash: string; mtime: number; size: number }>();
-	for (const row of db.query("SELECT id, path, hash, mtime, size FROM docs").all() as Array<{
-		id: number;
-		path: string;
-		hash: string;
-		mtime: number;
-		size: number;
-	}>) {
+	const known = new Map<string, KnownDoc>();
+	for (const row of db.query("SELECT id, path, hash, mtime, size FROM docs").all() as Array<
+		KnownDoc & { path: string }
+	>) {
 		known.set(row.path, row);
 	}
 
-	const stats: IndexStats = { indexed: 0, updated: 0, removed: 0, unchanged: 0, docs: 0, chunks: 0 };
+	const stats: IndexStats = { indexed: 0, updated: 0, removed: 0, moved: 0, unchanged: 0, docs: 0, chunks: 0 };
 	const seen = new Set<string>();
 	const bodies = new Map<string, string>();
+	const raws = new Map<string, string>();
+
+	reconcileMoves(root, files, known, raws, stats);
 
 	const upsertDoc = db.query(
 		`INSERT INTO docs (path, title, hash, mtime, size) VALUES (?, ?, ?, ?, ?)
@@ -120,11 +205,13 @@ async function runReindex(): Promise<IndexStats> {
 			stats.unchanged++;
 			continue;
 		}
-		let raw: string;
-		try {
-			raw = readFileSync(join(root, f.relPath), "utf-8");
-		} catch {
-			continue;
+		let raw = raws.get(f.relPath);
+		if (raw === undefined) {
+			try {
+				raw = readFileSync(join(root, f.relPath), "utf-8");
+			} catch {
+				continue;
+			}
 		}
 		const hash = String(Bun.hash(raw));
 		if (prev && prev.hash === hash) {
@@ -171,11 +258,12 @@ async function runReindex(): Promise<IndexStats> {
 		stats.removed++;
 	}
 
-	// A new or deleted note changes what every other note's wikilinks resolve to, so
-	// only that case pays for a full re-resolve; an edit re-links just the edited note.
-	if (stats.indexed || stats.removed) rebuildAllLinks(root);
+	// A new, deleted or moved note changes what every other note's wikilinks resolve to
+	// — a bare [[link]] with duplicate basenames is tiebroken on the top-level folder —
+	// so only those cases pay for a full re-resolve; an edit re-links just that note.
+	if (stats.indexed || stats.removed || stats.moved) rebuildAllLinks(root);
 	else if (stats.updated) relinkChanged(bodies);
-	if (stats.indexed || stats.updated || stats.removed) scheduleGraphRebuild();
+	if (stats.indexed || stats.updated || stats.removed || stats.moved) scheduleGraphRebuild();
 	setMeta(db, "last_index", new Date().toISOString());
 
 	Object.assign(stats, countStats());
