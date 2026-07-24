@@ -5,13 +5,13 @@
     "": {
       "name": "claude-brain",
       "dependencies": {
-        "@babylonjs/core": "^9.18.0",
-        "d3-force-3d": "^3.0.6",
         "fastembed": "^2.1.0",
         "sqlite-vec": "^0.1.9",
       },
       "devDependencies": {
+        "@babylonjs/core": "^9.18.0",
         "@types/bun": "latest",
+        "d3-force-3d": "^3.0.6",
         "typescript": "^5",
       },
     },

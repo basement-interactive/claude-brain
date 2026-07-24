@@ -1,25 +1,26 @@
 {
 	"name": "claude-brain",
-	"version": "0.2.0",
-	"description": "A local second brain for Claude Code: hybrid recall over notes and past sessions, episodic memory, note-graph traversal, 3D visualisation, cloud sync.",
+	"version": "0.3.0",
+	"description": "A local second brain for Claude Code: hybrid recall over notes and past sessions, episodic memory, note-graph traversal, design memory, 3D visualisation, cloud sync.",
 	"license": "MIT",
 	"type": "module",
 	"private": true,
 	"scripts": {
 		"build": "bun build frontend/dashboard.js --outfile public/bundle.js --minify",
 		"start": "bun server.ts",
-		"test": "bun test"
+		"test": "bun test",
+		"mktarball": "packaging/mktarball.sh"
 	},
 	"trustedDependencies": [
 		"onnxruntime-node"
 	],
 	"devDependencies": {
 		"@types/bun": "latest",
-		"typescript": "^5"
+		"typescript": "^5",
+		"@babylonjs/core": "^9.18.0",
+		"d3-force-3d": "^3.0.6"
 	},
 	"dependencies": {
-		"@babylonjs/core": "^9.18.0",
-		"d3-force-3d": "^3.0.6",
 		"fastembed": "^2.1.0",
 		"sqlite-vec": "^0.1.9"
 	}

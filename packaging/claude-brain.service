@@ -3,6 +3,11 @@ Description=claude-brain second brain server
 After=network.target
 
 [Service]
+# systemd's user-manager default PATH is /usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin,
+# but Claude Code installs to ~/.local/bin/claude. Without this the daemon reports the CLI
+# as missing and silently skips every LLM-assisted feature, while `claude --version` works
+# fine in the user's own terminal.
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin
 ExecStart=/usr/bin/bun /usr/share/claude-brain/server.ts
 Restart=on-failure
 RestartSec=5
