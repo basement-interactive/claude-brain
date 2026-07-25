@@ -6,7 +6,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, extname, join, relative, sep } from "node:path";
 import { chunkNote, stripFrontmatter, titleOf } from "./chunker";
 import { embedTexts } from "./embedder";
-import { scheduleGraphRebuild } from "./graph";
+import { refreshCentroids, scheduleGraphRebuild } from "./graph";
 import { resolveLink } from "./graph-builder";
 import { openBrainDb, setMeta } from "./index-db";
 import { parseLinks, parseTags } from "./relations";
@@ -381,10 +381,10 @@ export async function embedPending(): Promise<number> {
 		for (;;) {
 			const pending = db
 				.query(
-					`SELECT c.id, d.title, c.heading, c.text FROM chunks c
+					`SELECT c.id, c.doc_id, d.title, c.heading, c.text FROM chunks c
 					 JOIN docs d ON d.id = c.doc_id WHERE c.embedded = 0 LIMIT 32`,
 				)
-				.all() as Array<{ id: number; title: string; heading: string; text: string }>;
+				.all() as Array<{ id: number; doc_id: number; title: string; heading: string; text: string }>;
 			if (pending.length === 0) return total;
 			// qmd trick: prefix title into every embedded chunk for cheap relevance gain.
 			const vecs = await embedTexts(pending.map((p) => `${p.title} | ${p.heading} | ${p.text}`));
@@ -402,6 +402,9 @@ export async function embedPending(): Promise<number> {
 					mark.run(chunk.id);
 				}
 			})();
+			// The note's centroid is the mean of its chunk vectors, so it moved. Refreshing
+			// per batch keeps the similarity pass from re-aggregating every vector later.
+			refreshCentroids(pending.map((p) => p.doc_id));
 			total += pending.length;
 		}
 	} finally {

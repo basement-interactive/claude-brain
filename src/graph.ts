@@ -38,39 +38,76 @@ function toFloats(raw: Uint8Array): Float32Array {
 	return new Float32Array(raw.buffer, raw.byteOffset, EMBED_DIM);
 }
 
-/** Mean of a note's chunk vectors — one point standing for the whole note. */
-function docCentroids(): Map<number, Float32Array> {
+/** Recompute and store centroids for the given notes, or all of them when none is given. */
+export function refreshCentroids(docIds?: Iterable<number>): number {
 	const { db, vectors } = openBrainDb();
-	const centroids = new Map<number, Float32Array>();
-	if (!vectors) return centroids;
+	if (!vectors) return 0;
+	const ids = docIds ? [...new Set(docIds)] : null;
+	const where = ids ? `WHERE c.doc_id IN (${ids.map(() => "?").join(",")})` : "";
+	if (ids && ids.length === 0) return 0;
 	const rows = db
 		.query(
 			`SELECT c.doc_id AS docId, v.embedding AS embedding
-			 FROM vec_chunks v JOIN chunks c ON c.id = v.chunk_id`,
+			 FROM vec_chunks v JOIN chunks c ON c.id = v.chunk_id ${where}`,
 		)
-		.all() as Array<{ docId: number; embedding: Uint8Array }>;
+		.all(...(ids ?? [])) as Array<{ docId: number; embedding: Uint8Array }>;
 
+	const sums = new Map<number, Float32Array>();
 	const counts = new Map<number, number>();
 	for (const row of rows) {
 		const vec = toFloats(row.embedding);
-		let acc = centroids.get(row.docId);
+		let acc = sums.get(row.docId);
 		if (!acc) {
 			acc = new Float32Array(EMBED_DIM);
-			centroids.set(row.docId, acc);
+			sums.set(row.docId, acc);
 		}
 		for (let i = 0; i < EMBED_DIM; i++) acc[i]! += vec[i]!;
 		counts.set(row.docId, (counts.get(row.docId) ?? 0) + 1);
 	}
-	for (const [docId, acc] of centroids) {
-		const n = counts.get(docId) ?? 1;
-		let norm = 0;
-		for (let i = 0; i < EMBED_DIM; i++) {
-			acc[i]! /= n;
-			norm += acc[i]! * acc[i]!;
+
+	const upsert = db.query(
+		"INSERT INTO doc_centroids (doc_id, embedding) VALUES (?, ?) ON CONFLICT(doc_id) DO UPDATE SET embedding = excluded.embedding",
+	);
+	db.transaction(() => {
+		// A note whose chunks all vanished has no centroid to store; drop the stale one.
+		if (ids) {
+			const gone = ids.filter((id) => !sums.has(id));
+			if (gone.length > 0) {
+				db.query(`DELETE FROM doc_centroids WHERE doc_id IN (${gone.map(() => "?").join(",")})`).run(...gone);
+			}
 		}
-		norm = Math.sqrt(norm) || 1;
-		for (let i = 0; i < EMBED_DIM; i++) acc[i]! /= norm;
+		for (const [docId, acc] of sums) {
+			const n = counts.get(docId) ?? 1;
+			let norm = 0;
+			for (let i = 0; i < EMBED_DIM; i++) {
+				acc[i]! /= n;
+				norm += acc[i]! * acc[i]!;
+			}
+			norm = Math.sqrt(norm) || 1;
+			for (let i = 0; i < EMBED_DIM; i++) acc[i]! /= norm;
+			upsert.run(docId, new Uint8Array(acc.buffer, acc.byteOffset, acc.byteLength));
+		}
+	})();
+	return sums.size;
+}
+
+function docCentroids(): Map<number, Float32Array> {
+	const { db, vectors } = openBrainDb();
+	const centroids = new Map<number, Float32Array>();
+	if (!vectors) return centroids;
+	let rows = db.query("SELECT doc_id AS docId, embedding FROM doc_centroids").all() as Array<{
+		docId: number;
+		embedding: Uint8Array;
+	}>;
+	// First run after the table appears, or after a re-embed that predates it.
+	if (rows.length === 0) {
+		refreshCentroids();
+		rows = db.query("SELECT doc_id AS docId, embedding FROM doc_centroids").all() as Array<{
+			docId: number;
+			embedding: Uint8Array;
+		}>;
 	}
+	for (const row of rows) centroids.set(row.docId, toFloats(row.embedding));
 	return centroids;
 }
 

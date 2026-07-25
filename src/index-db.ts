@@ -123,6 +123,16 @@ function createSemanticTables(db: Database, vectors: boolean): void {
 		PRIMARY KEY (doc_id, tag)
 	)`);
 	db.run("CREATE INDEX IF NOT EXISTS doc_tags_tag ON doc_tags(tag)");
+	/**
+	 * One 384-dim vector per note, the mean of its chunk vectors. Persisted rather than
+	 * re-aggregated because the similarity pass compares every pair: re-reading all chunk
+	 * vectors on each rebuild was 8 ms at 1100 chunks and grows with the corpus, and
+	 * keeping them lets a rebuild touch only the notes that actually changed.
+	 */
+	db.run(`CREATE TABLE IF NOT EXISTS doc_centroids (
+		doc_id INTEGER PRIMARY KEY REFERENCES docs(id) ON DELETE CASCADE,
+		embedding BLOB NOT NULL
+	)`);
 	db.run("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
 	if (vectors) {
 		db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
