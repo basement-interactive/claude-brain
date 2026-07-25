@@ -78,6 +78,16 @@ const CANDIDATES = 30;
  */
 const SNIPPET_CHARS = 280;
 const FULL_SNIPPET_CHARS = 900;
+/**
+ * A note that documents a problem is written Symptom -> Root cause -> Fix, and a question
+ * is asked in symptom language, so the symptom chunk always outranks the fix chunk — then
+ * poolByDoc keeps the winner and discards the sibling holding the answer. Measured on a
+ * labelled set: the gold note was retrieved 10/10 times and the fix reached the caller
+ * 1/10. So the budget is split rather than spent entirely on the best-matching chunk.
+ */
+const SOLUTION_CHARS = 180;
+const SOLUTION_HEADING = /^##+[ \t]*(fix|solution|resolution|workaround)\b[^\n]*$/im;
+
 /** An episode is a reminder, not a document — it never needs a note-sized excerpt. */
 const EPISODE_SNIPPET_CHARS = 200;
 /** Episodes are raw and repetitive next to a curated note; they earn less trust. */
@@ -375,6 +385,33 @@ function diversifyEpisodes(candidates: EpisodeCandidate[], k: number): EpisodeCa
 	return out;
 }
 
+/**
+ * The solution section of each doc, found across *all* its chunks — the point is that it
+ * usually lives in a chunk other than the one that matched.
+ */
+function solutionsFor(docIds: number[]): Map<number, string> {
+	const out = new Map<number, string>();
+	if (docIds.length === 0) return out;
+	const { db } = openBrainDb();
+	const rows = db
+		.query(
+			`SELECT doc_id, text FROM chunks WHERE doc_id IN (${docIds.map(() => "?").join(",")}) ORDER BY doc_id, pos`,
+		)
+		.all(...docIds) as Array<{ doc_id: number; text: string }>;
+	for (const row of rows) {
+		if (out.has(row.doc_id)) continue;
+		const match = SOLUTION_HEADING.exec(row.text);
+		if (!match) continue;
+		const body = row.text
+			.slice(match.index + match[0].length)
+			// Stop at the next heading: the fix is the block under its own heading.
+			.split(/\n##+\s/)[0]!
+			.trim();
+		if (body) out.set(row.doc_id, body);
+	}
+	return out;
+}
+
 function clip(text: string, max: number): string {
 	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
@@ -420,15 +457,23 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 	}
 
 	const budget = options.full ? FULL_SNIPPET_CHARS : SNIPPET_CHARS;
-	const noteHits: RecallHit[] = topNotes.map((c) => ({
-		kind: "note",
-		path: c.path,
-		title: c.title,
-		heading: c.heading,
-		score: Number(c.score.toFixed(4)),
-		snippet: focusSnippet(c.text, query, budget),
-		via: c.via,
-	}));
+	const solutions = options.full ? new Map<number, string>() : solutionsFor(topNotes.map((c) => c.docId));
+	const noteHits: RecallHit[] = topNotes.map((c) => {
+		const focused = focusSnippet(c.text, query, budget);
+		const solution = solutions.get(c.docId);
+		// Skip when the matched chunk already is the fix, or already carries its opening —
+		// repeating it would spend the budget saying the same thing twice.
+		const already = !solution || focused.includes(solution.slice(0, 40));
+		return {
+			kind: "note" as const,
+			path: c.path,
+			title: c.title,
+			heading: c.heading,
+			score: Number(c.score.toFixed(4)),
+			snippet: already ? focused : `${focused}\n\nFix — ${clip(solution, SOLUTION_CHARS)}`,
+			via: c.via,
+		};
+	});
 	const episodeHits: RecallHit[] = episodes.map((e) => ({
 		kind: "episode",
 		path: `session/${e.sessionId}`,
