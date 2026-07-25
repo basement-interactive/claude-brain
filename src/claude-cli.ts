@@ -588,18 +588,49 @@ export async function describeImageJson<T extends { viewed: boolean }>(
 	schema: Record<string, unknown>,
 	opts: AskOptions = {},
 ): Promise<T | null> {
+	return describeImagesJson<T>([imagePath], instruction, schema, opts);
+}
+
+/**
+ * The same thing across a SET of images, which is what a design board is: a couple of
+ * screenshots of one product, a light shot and a dark one. Reasoning over the set is the
+ * point — one frame shows a colour, several show which colour is the accent and which was
+ * incidental, and only a set can distinguish a rule from a coincidence.
+ *
+ * Unreadable members are dropped rather than failing the batch, because one truncated file
+ * should not cost the user the other four; null comes back only when nothing survives. The
+ * per-image ceilings still apply individually, and the CLI is metered, so callers are
+ * expected to bound how many they send.
+ */
+export async function describeImagesJson<T extends { viewed: boolean }>(
+	imagePaths: string[],
+	instruction: string,
+	schema: Record<string, unknown>,
+	opts: AskOptions = {},
+): Promise<T | null> {
 	if (!(await isAvailable())) return null;
 
-	const file = Bun.file(imagePath);
-	if (!(await file.exists()) || file.size > MAX_IMAGE_BYTES) return null;
-	const meta = imageMeta(new Uint8Array(await file.arrayBuffer()));
-	if (!meta?.complete || meta.width > MAX_IMAGE_EDGE || meta.height > MAX_IMAGE_EDGE) return null;
+	const usable: string[] = [];
+	for (const path of imagePaths) {
+		const file = Bun.file(path);
+		if (!(await file.exists()) || file.size > MAX_IMAGE_BYTES) continue;
+		const meta = imageMeta(new Uint8Array(await file.arrayBuffer()));
+		if (!meta?.complete || meta.width > MAX_IMAGE_EDGE || meta.height > MAX_IMAGE_EDGE) continue;
+		usable.push(path);
+	}
+	if (usable.length === 0) return null;
 
-	const options: AskOptions = { ...opts, images: [imagePath] };
+	const options: AskOptions = { ...opts, images: usable };
+	const listed =
+		usable.length === 1
+			? `the image file at ${usable[0]}`
+			: `all ${usable.length} image files below, treating them as views of ONE design:\n${usable
+					.map((p) => `- ${p}`)
+					.join("\n")}`;
 	return serialize(async () => {
 		if (options.signal?.aborted) return null;
 		const args = [...baseArgs(options), "--json-schema", JSON.stringify(schema)];
-		const { envelope, text } = await invoke(`Read the image file at ${imagePath}, then: ${instruction}`, args, options);
+		const { envelope, text } = await invoke(`Read ${listed}, then: ${instruction}`, args, options);
 		if (!envelope || text === null) return null;
 		if (envelope.permission_denials?.length) return null;
 		const described = envelope.structured_output as T | undefined;

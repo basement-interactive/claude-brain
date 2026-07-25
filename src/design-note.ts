@@ -19,6 +19,7 @@ import { designFolder, loadConfig, vaultReady, vaultRoot } from "./config";
 import {
 	type DesignRow,
 	VAULT_IMAGE_SUBDIR,
+	listSources,
 	freeFileName,
 	imagePath,
 	renderPath,
@@ -151,7 +152,13 @@ function section(heading: string, lines: string[]): string[] {
  * that rclone-syncs to other machines makes it wrong everywhere except the machine that
  * wrote it; `design show` resolves the real path at print time instead.
  */
-export function renderDesignNote(spec: DesignSpec, row: DesignRow, imageRel?: string): string {
+export function renderDesignNote(
+	spec: DesignSpec,
+	row: DesignRow,
+	imageRel?: string,
+	extraRels: string[] = [],
+	sourceUrls: string[] = [],
+): string {
 	const tags = ["design", ...spec.mood.map(tagify)].filter(Boolean).slice(0, MAX_TAGS);
 	// Through text() even though saveDesign now stores a collapsed source_name: rows written
 	// by an older version still hold whatever the filename had in it, and a newline here
@@ -192,7 +199,13 @@ export function renderDesignNote(spec: DesignSpec, row: DesignRow, imageRel?: st
 	lines.push(...section("Avoid", spec.avoid));
 	lines.push(...section("Recreating it", spec.recreate));
 
-	if (imageRel) lines.push(`![preview](${imageRel})`, "");
+	// Every reference on the board, not just the first: a design assembled from a light and
+	// a dark screenshot is only legible if the note shows both.
+	for (const rel of imageRel ? [imageRel] : []) lines.push(`![preview](${rel})`, "");
+	for (const extra of extraRels) lines.push(`![reference](${extra})`, "");
+	if (sourceUrls.length) {
+		lines.push("## Captured from", ...sourceUrls.map((u) => `- ${u}`), "");
+	}
 	return `${lines.join("\n").trimEnd()}\n`;
 }
 
@@ -305,10 +318,14 @@ export function writeDesignNote(row: DesignRow, spec: DesignSpec): WriteNoteResu
 	const dir = join(root, folder);
 	try {
 		mkdirSync(dir, { recursive: true });
-		const imageRel = loadConfig().designs.copyImages ? copyPreview(row, dir) : undefined;
+		const copyImages = loadConfig().designs.copyImages;
+		const imageRel = copyImages ? copyPreview(row, dir) : undefined;
+		const extras = copyImages ? boardExtras(row, dir) : { rels: [], urls: [] };
+		// The URL list is provenance and costs nothing to keep, even when images are off.
+		if (!copyImages) extras.urls = boardExtras({ ...row }, dir).urls;
 		const file = writeNewFile(
 			freeFileName(join(dir, `${noteBaseName(spec.name, `Design ${row.id}`)}.md`)),
-			renderDesignNote(spec, row, imageRel),
+			renderDesignNote(spec, row, imageRel, extras.rels, extras.urls),
 		);
 		const rel = `${folder}/${file.slice(file.lastIndexOf("/") + 1)}`;
 		updateDesign(row.id, { notePath: rel, noteMissing: false, vault: root });
@@ -333,6 +350,29 @@ function copyPreview(row: DesignRow, dir: string): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/** The board's other image references, and the URLs it was captured from. */
+function boardExtras(row: DesignRow, dir: string): { rels: string[]; urls: string[] } {
+	const rels: string[] = [];
+	const urls: string[] = [];
+	let sources: ReturnType<typeof listSources>;
+	try {
+		sources = listSources(row.id);
+	} catch {
+		return { rels, urls };
+	}
+	for (const src of sources) {
+		if (src.kind === "url") {
+			if (src.url) urls.push(src.url);
+			continue;
+		}
+		// The row's own id is already the main preview; skip it rather than duplicate.
+		if (src.id === row.id) continue;
+		const rel = copyPreview({ ...row, id: src.id, mime: src.mime, render: src.render, thumb: src.thumb } as DesignRow, dir);
+		if (rel) rels.push(rel);
+	}
+	return { rels, urls };
 }
 
 /**

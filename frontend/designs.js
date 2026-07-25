@@ -263,8 +263,52 @@ export function createDesignsTab(container) {
 		message = "";
 		refresh();
 	};
+	// Capturing a URL is the same act as dropping a screenshot — a reference for a design —
+	// so it lives in the same row of controls rather than in a mode of its own.
+	const urlInput = el("input", "settings-input designs-url");
+	urlInput.type = "url";
+	urlInput.placeholder = "…or paste a URL to learn its design";
+	const urlBtn = text("button", "settings-btn", "Capture");
+	urlBtn.type = "button";
+
+	async function captureUrl() {
+		const value = urlInput.value.trim();
+		if (!value) return;
+		urlBtn.disabled = true;
+		const wasLabel = urlBtn.textContent;
+		// A capture fetches a page, its stylesheets and sometimes its JS, so it is seconds
+		// rather than milliseconds. Say so instead of looking hung.
+		urlBtn.textContent = "Reading…";
+		message = `reading ${value}…`;
+		renderNotices();
+		const out = await api("/api/designs/url", { url: value });
+		urlBtn.disabled = false;
+		urlBtn.textContent = wasLabel;
+		if (!out.ok) {
+			message = out.error ?? "that page could not be read";
+			renderNotices();
+			return;
+		}
+		urlInput.value = "";
+		const c = out.capture ?? {};
+		const bits = [];
+		if (c.sheetsRead !== undefined) bits.push(`${c.sheetsRead}/${c.sheetsSeen} stylesheets`);
+		if (c.rules) bits.push(`${c.rules} rules`);
+		if (c.colors?.length) bits.push(`${c.colors.length} colours`);
+		if (c.frameworks?.length) bits.push(c.frameworks.join(", "));
+		message = `captured ${c.title || value}${bits.length ? ` — ${bits.join(", ")}` : ""}`;
+		pollStalled = false;
+		await refresh();
+		openDetail(out.id);
+	}
+
+	urlBtn.onclick = captureUrl;
+	urlInput.onkeydown = (e) => {
+		if (e.key === "Enter") captureUrl();
+	};
+
 	const tools = el("div", "designs-tools");
-	tools.append(search, addBtn, reloadBtn);
+	tools.append(search, addBtn, urlInput, urlBtn, reloadBtn);
 	head.appendChild(tools);
 
 	const notices = el("div", "designs-notices");
@@ -646,7 +690,98 @@ export function createDesignsTab(container) {
 			detail.appendChild(text("div", "panel-error", record.error ?? "this design is no longer in the library"));
 			return;
 		}
-		renderDetail(record.row, record.spec ?? parseSpec(record.row.spec));
+		renderDetail(record.row, record.spec ?? parseSpec(record.row.spec), record.sources ?? []);
+	}
+
+	/**
+	 * A design is a board, so show what it was built from and let the user change it. Every
+	 * change re-queues the description, because a board with a new reference on it is no
+	 * longer described by the text written for the old one.
+	 */
+	function renderReferences(row, sources, inner, after) {
+		if (!inner.isConnected) return;
+		const wrap = el("div", "design-refs");
+		wrap.appendChild(text("h4", null, sources.length > 1 ? `${sources.length} references` : "References"));
+
+		const strip = el("div", "design-ref-strip");
+		for (const src of sources) {
+			const tile = el("div", `design-ref ${src.kind}`);
+			if (src.kind === "image") {
+				const thumb = el("img");
+				thumb.loading = "lazy";
+				thumb.alt = src.name || "";
+				thumb.src = `/api/designs/${encodeURIComponent(src.id)}/${src.thumb ? "thumb" : "image"}`;
+				tile.appendChild(thumb);
+			} else {
+				const glyph = text("div", "design-ref-url", "URL");
+				tile.appendChild(glyph);
+			}
+			const label = text("span", "design-ref-name", src.kind === "url" ? src.url : src.name);
+			if (src.kind === "url") label.title = src.url;
+			tile.appendChild(label);
+			if (src.kind === "url" && !src.captured) {
+				tile.appendChild(text("span", "design-ref-warn", "not read"));
+			}
+			const drop = text("button", "design-ref-drop", "×");
+			drop.type = "button";
+			drop.title = "Remove this reference";
+			drop.onclick = async () => {
+				drop.disabled = true;
+				const out = await api(`/api/designs/${encodeURIComponent(row.id)}/detach`, { sourceId: src.id });
+				if (!out.ok) {
+					drop.disabled = false;
+					return;
+				}
+				pollStalled = false;
+				await refresh();
+				openDetail(row.id);
+			};
+			tile.appendChild(drop);
+			strip.appendChild(tile);
+		}
+		wrap.appendChild(strip);
+
+		const addRef = text("button", "settings-btn ghost", "Add a screenshot");
+		addRef.type = "button";
+		addRef.onclick = () => refPicker.click();
+		const refPicker = el("input");
+		refPicker.type = "file";
+		refPicker.accept = ACCEPT;
+		refPicker.hidden = true;
+		refPicker.onchange = async () => {
+			const file = refPicker.files?.[0];
+			refPicker.value = "";
+			if (!file) return;
+			addRef.disabled = true;
+			addRef.textContent = "Adding…";
+			const body = new FormData();
+			body.append("file", file, file.name);
+			try {
+				await fetch(`/api/designs/${encodeURIComponent(row.id)}/attach`, { method: "POST", body });
+			} catch {
+				/* the refresh below shows whatever actually landed */
+			}
+			pollStalled = false;
+			await refresh();
+			openDetail(row.id);
+		};
+
+		const urlRef = el("input", "settings-input");
+		urlRef.type = "url";
+		urlRef.placeholder = "Add another URL to this design";
+		urlRef.onkeydown = async (e) => {
+			if (e.key !== "Enter" || !urlRef.value.trim()) return;
+			urlRef.disabled = true;
+			await api("/api/designs/url", { url: urlRef.value.trim(), designId: row.id });
+			pollStalled = false;
+			await refresh();
+			openDetail(row.id);
+		};
+
+		const row2 = el("div", "design-ref-actions");
+		row2.append(addRef, refPicker, urlRef);
+		wrap.appendChild(row2);
+		after.after(wrap);
 	}
 
 	function closeDetail() {
@@ -667,7 +802,7 @@ export function createDesignsTab(container) {
 		return close;
 	}
 
-	function renderDetail(row, spec) {
+	function renderDetail(row, spec, sources = []) {
 		detail.innerHTML = "";
 		const close = closeButton();
 		detail.appendChild(close);
@@ -688,6 +823,7 @@ export function createDesignsTab(container) {
 		if (row.mime) meta.appendChild(text("span", null, row.mime));
 		if (row.bytes) meta.appendChild(text("span", null, bytesLabel(row.bytes)));
 		if (row.created) meta.appendChild(text("span", null, `added ${whenLabel(row.created)}`));
+		queueMicrotask(() => renderReferences(row, sources, inner, meta));
 		inner.appendChild(meta);
 
 		if (row.source_name && row.source_name !== title) {

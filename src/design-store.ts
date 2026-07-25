@@ -38,6 +38,10 @@ export type DesignStatus =
 	| "described"
 	/** Described, but the description is nearly empty (a greyscale wireframe). Not retried. */
 	| "thin"
+	/** A URL capture reached the page but could not read a design out of it — a fully
+	 *  client-rendered app, or a bot wall. The board is fine; it just needs a screenshot
+	 *  dropped on it, which is the one thing no static fetch can do for the user. */
+	| "needs-screenshot"
 	/** Too big for a vision call as-is; the dashboard has to downscale it first. */
 	| "needs-render"
 	/** LLM features were off when its turn came. */
@@ -57,6 +61,7 @@ const RESETTABLE: ReadonlySet<DesignStatus> = new Set<DesignStatus>([
 	"unavailable",
 	"disabled",
 	"needs-render",
+	"needs-screenshot",
 ]);
 
 /** Column-for-column, as stored. Snake_case matches the table so `SELECT *` needs no mapping. */
@@ -123,6 +128,124 @@ export function thumbPath(id: string): string {
 
 export function renderPath(id: string): string {
 	return join(RENDER_DIR, `${id}.webp`);
+}
+
+/* --- References ------------------------------------------------------------
+ * A design is a board: several screenshots of the same product, a light and a dark
+ * shot, a URL whose style the user liked. One picture describes a design language
+ * poorly, and the model reasons far better across a set than across a single frame.
+ *
+ * An image reference keeps the content hash as its id, so identical uploads still
+ * collapse onto one blob and files written before this existed keep their names.
+ */
+
+export type SourceKind = "image" | "url";
+
+export interface DesignSource {
+	id: string;
+	design_id: string;
+	kind: SourceKind;
+	ordinal: number;
+	source_name: string;
+	url: string;
+	mime: string;
+	bytes: number;
+	width: number;
+	height: number;
+	thumb: number;
+	render: number;
+	/** url references only: the evidence gathered from the page, handed to the model. */
+	extract: string;
+	created: number;
+}
+
+/** Absolute path of a stored image reference. Mirrors imagePath, keyed on the reference. */
+export function sourcePath(source: Pick<DesignSource, "id" | "mime">): string {
+	return join(DESIGN_DIR, `${source.id}.${EXTENSION[source.mime as ImageMime] ?? "bin"}`);
+}
+
+export function listSources(designId: string): DesignSource[] {
+	return openBrainDb()
+		.db.query("SELECT * FROM design_sources WHERE design_id = ? ORDER BY ordinal, created")
+		.all(designId) as DesignSource[];
+}
+
+export function getSource(id: string): DesignSource | null {
+	return (openBrainDb().db.query("SELECT * FROM design_sources WHERE id = ?").get(id) as DesignSource) ?? null;
+}
+
+/** Next free slot on a board, so references keep the order they were added in. */
+function nextOrdinal(designId: string): number {
+	const row = openBrainDb()
+		.db.query("SELECT COALESCE(MAX(ordinal), -1) AS n FROM design_sources WHERE design_id = ?")
+		.get(designId) as { n: number } | null;
+	return (row?.n ?? -1) + 1;
+}
+
+export interface AddSourceInput {
+	designId: string;
+	kind: SourceKind;
+	id: string;
+	sourceName?: string;
+	url?: string;
+	mime?: string;
+	bytes?: number;
+	width?: number;
+	height?: number;
+	thumb?: number;
+	render?: number;
+	extract?: string;
+}
+
+/**
+ * Attach a reference to a board. INSERT OR IGNORE, because the id of an image reference is
+ * its content hash: dropping the same screenshot on the same board twice is a no-op rather
+ * than a duplicate tile, which is what someone re-dragging a file actually means.
+ */
+export function addSource(input: AddSourceInput): DesignSource | null {
+	openBrainDb().db.run(
+		`INSERT OR IGNORE INTO design_sources
+		 (id, design_id, kind, ordinal, source_name, url, mime, bytes, width, height, thumb, render, extract, created)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		[
+			input.id,
+			input.designId,
+			input.kind,
+			nextOrdinal(input.designId),
+			input.sourceName ?? "",
+			input.url ?? "",
+			input.mime ?? "",
+			input.bytes ?? 0,
+			input.width ?? 0,
+			input.height ?? 0,
+			input.thumb ?? 0,
+			input.render ?? 0,
+			input.extract ?? "",
+			Date.now(),
+		],
+	);
+	return getSource(input.id);
+}
+
+/**
+ * Detach a reference. The blob is left alone: an image reference is keyed by content hash,
+ * so the same bytes may well be cited by another board, and forgetDesign already owns the
+ * question of which files are safe to delete.
+ */
+export function removeSource(id: string): boolean {
+	const db = openBrainDb().db;
+	const before = db.query("SELECT COUNT(*) AS n FROM design_sources WHERE id = ?").get(id) as { n: number };
+	if (!before?.n) return false;
+	db.run("DELETE FROM design_sources WHERE id = ?", [id]);
+	return true;
+}
+
+/** Is this blob still cited by any board? Guards deletion. */
+export function sourceIsShared(id: string, exceptDesignId: string): boolean {
+	const row = openBrainDb()
+		.db.query("SELECT COUNT(*) AS n FROM design_sources WHERE id = ? AND design_id != ?")
+		.get(id, exceptDesignId) as { n: number } | null;
+	return (row?.n ?? 0) > 0;
 }
 
 /** Where design-note.ts puts its copy of the image, when the user asked for one. */
@@ -323,6 +446,53 @@ function cleanName(raw: string): string {
  * when the design has since been forgotten — writing a blob no row can name again leaks a
  * file `forgetDesign` will never find, and reporting success for it is a lie to the caller.
  */
+/**
+ * Start a board from a URL. The row carries no image bytes — the evidence is the capture
+ * text on its reference — so `mime`/`bytes` stay empty and every reader that asks for a
+ * blob is expected to consult the references instead.
+ *
+ * The id is a hash of the canonical URL rather than of any content, which gives the same
+ * idempotence an image upload has: adding the same link twice returns the same board.
+ */
+export function saveUrlDesign(input: {
+	url: string;
+	caption?: string;
+	name?: string;
+	extract: string;
+	status?: DesignStatus;
+}): { row: DesignRow; fresh: boolean } {
+	const id = new Bun.CryptoHasher("sha256").update(`url:${input.url}`).digest("hex").slice(0, 16);
+	const existing = getDesign(id);
+	const host = ((): string => {
+		try {
+			return new URL(input.url).hostname.replace(/^www\./, "");
+		} catch {
+			return input.url.slice(0, 60);
+		}
+	})();
+	if (!existing) {
+		openBrainDb().db.run(
+			`INSERT INTO designs (id, vault, source_name, caption, mime, bytes, width, height, thumb, render, status, created)
+			 VALUES (?, '', ?, ?, '', 0, 0, 0, 0, 0, ?, ?)
+			 ON CONFLICT(id) DO NOTHING`,
+			[id, cleanName(input.name || host), cleanName(input.caption ?? ""), input.status ?? "queued", Date.now()],
+		);
+	}
+	addSource({
+		designId: id,
+		kind: "url",
+		// A reference id must be distinct from the board id, or a second URL on the same
+		// board would collide with it.
+		id: new Bun.CryptoHasher("sha256").update(`src:${input.url}`).digest("hex").slice(0, 16),
+		sourceName: host,
+		url: input.url,
+		extract: input.extract,
+	});
+	const row = getDesign(id);
+	if (!row) throw new Error("design row vanished immediately after insert");
+	return { row, fresh: !existing };
+}
+
 export async function attachThumb(id: string, bytes: Uint8Array): Promise<boolean> {
 	if (!validId(id) || !sniffMime(bytes) || !getDesign(id)) return false;
 	ensureDirs();

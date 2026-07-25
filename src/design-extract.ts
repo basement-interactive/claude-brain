@@ -17,10 +17,10 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { status as claudeStatus, describeImageJson, sessionSpendUsd, spendTodayUsd } from "./claude-cli";
+import { askJson, status as claudeStatus, describeImagesJson, sessionSpendUsd, spendTodayUsd } from "./claude-cli";
 import { loadConfig, vaultReady, vaultRoot } from "./config";
 import { type DesignSpec, normalizeSpec, writeDesignNote } from "./design-note";
-import { type DesignRow, getDesign, imagePath, renderPath, updateDesign } from "./design-store";
+import { type DesignRow, type DesignSource, getDesign, imagePath, listSources, renderPath, sourcePath, updateDesign } from "./design-store";
 import { imageMeta } from "./image-meta";
 import { openBrainDb } from "./index-db";
 
@@ -279,6 +279,64 @@ async function visionSource(row: DesignRow): Promise<{ path: string } | { blocke
 	return { path };
 }
 
+/**
+ * Everything this board can show the model: the readable images, and the text captured
+ * from any URLs on it. A board is only blocked when NOTHING on it is usable — one
+ * unreadable screenshot alongside three good ones costs nothing.
+ */
+async function boardEvidence(
+	row: DesignRow,
+): Promise<{ images: string[]; evidence: string } | { blocked: string; status?: "needs-render" | "needs-screenshot" }> {
+	const sources: DesignSource[] = listSources(row.id);
+	const images: string[] = [];
+	const extracts: string[] = [];
+	let fixable = "";
+
+	// A board that predates references still has its bytes on the row itself.
+	if (sources.length === 0) {
+		const legacy = await visionSource(row);
+		if ("blocked" in legacy) return { blocked: legacy.blocked, status: legacy.fixable ? "needs-render" : undefined };
+		return { images: [legacy.path], evidence: "" };
+	}
+
+	let ogOnly = true;
+	for (const src of sources) {
+		if (src.kind === "url") {
+			if (src.extract.trim()) extracts.push(src.extract);
+			continue;
+		}
+		if (!src.source_name.startsWith("og:image")) ogOnly = false;
+		const usable = await visionSource({ ...row, id: src.id, mime: src.mime, render: src.render } as DesignRow);
+		if ("blocked" in usable) {
+			if (usable.fixable) fixable = usable.blocked;
+			continue;
+		}
+		images.push(usable.path);
+	}
+
+	if (images.length === 0 && extracts.length === 0) {
+		return fixable
+			? { blocked: fixable, status: "needs-render" }
+			: { blocked: "nothing on this design could be read — add a screenshot to it", status: "needs-screenshot" };
+	}
+	if (extracts.length === 0) return { images, evidence: "" };
+	// A link-preview card is not the product. Left unsaid, the model describes the card —
+	// "Linear Logo Splash", a centred wordmark on a flat background — and files that as the
+	// site's design language, which is worse than having no image at all.
+	const caveat =
+		images.length > 0 && ogOnly
+			? "\n\nThe image on this board is the page's own link-preview card, which is usually a " +
+				"logo or marketing artwork rather than a picture of the interface. Describe the DESIGN " +
+				"SYSTEM the measurements below establish, using the image only for things they cannot " +
+				"show — mood, imagery, how the brand presents itself. Do not describe the card as if it " +
+				"were the product's UI."
+			: "";
+	return {
+		images,
+		evidence: `Measurements read from the page${extracts.length > 1 ? "s" : ""} on this board:\n\n${extracts.join("\n\n---\n\n")}${caveat}`,
+	};
+}
+
 function fail(row: DesignRow, error: string): void {
 	const attempts = row.attempts + 1;
 	stalls.delete(row.id);
@@ -328,10 +386,10 @@ export async function extractDesign(id: string): Promise<void> {
 		return;
 	}
 
-	const source = await visionSource(row);
-	if ("blocked" in source) {
-		if (source.fixable) updateDesign(id, { status: "needs-render", error: source.blocked });
-		else fail(row, source.blocked);
+	const board = await boardEvidence(row);
+	if ("blocked" in board) {
+		if (board.status) updateDesign(id, { status: board.status, error: board.blocked });
+		else fail(row, board.blocked);
 		return;
 	}
 
@@ -340,11 +398,27 @@ export async function extractDesign(id: string): Promise<void> {
 	// call back to `queued` and pay for the same description twice.
 	updateDesign(id, { status: "extracting", error: "", nextAttemptAt: Date.now() + EXTRACTING_LEASE_MS });
 	const spentBefore = sessionSpendUsd();
-	const described = await describeImageJson<{ viewed: boolean }>(source.path, INSTRUCTION, DESIGN_SCHEMA, {
+	const opts = {
 		model: cfg.llm.model,
 		maxCostUsd: MAX_COST_PER_IMAGE_USD,
 		label: `design:${id}`,
-	});
+	};
+	// Images and captured pages are the same evidence in different formats, so a board with
+	// both gets one call that sees both. With no image at all there is nothing to "view",
+	// so the url-only path drops the viewed guard and asks for the same schema from text —
+	// and, because opts.images is empty, baseArgs gives that call no tools at all.
+	const described = board.images.length
+		? await describeImagesJson<{ viewed: boolean }>(
+				board.images,
+				board.evidence ? `${INSTRUCTION}\n\n${board.evidence}` : INSTRUCTION,
+				DESIGN_SCHEMA,
+				opts,
+			)
+		: await askJson<{ viewed: boolean }>(
+				`${INSTRUCTION}\n\nYou have no screenshot. Work only from the measurements below, which were read out of the page itself.\n\n${board.evidence}`,
+				DESIGN_SCHEMA,
+				opts,
+			);
 
 	if (!described) {
 		const st = await claudeStatus();

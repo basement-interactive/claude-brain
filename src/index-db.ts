@@ -51,6 +51,7 @@ export function openBrainDb(path?: string): BrainDb {
 	reembedIfPoolingChanged(db, vectors);
 	createDesignTables(db);
 	migrate(db);
+	backfillDesignSources(db);
 
 	opened = { db, vectors };
 	return opened;
@@ -245,6 +246,72 @@ function createDesignTables(db: Database): void {
 	// CREATE INDEX here would throw "already exists" on the second run and brick the
 	// install for everyone.
 	db.run("CREATE INDEX IF NOT EXISTS designs_status ON designs(status, created DESC)");
+
+	// A design started life as exactly one image, so its reference lived in the columns
+	// above. It is really a BOARD — several screenshots of the same product, or a site
+	// whose style you liked — and one picture is a poor description of a design language.
+	// Each reference is now a row here, and a reference is not necessarily an image: a URL
+	// is the same kind of evidence arriving in a different format.
+	//
+	// `id` stays the content hash for images, so the blob on disk keeps its filename and
+	// identical uploads still dedupe. The legacy columns on `designs` are left alone rather
+	// than dropped: SQLite would need a table rebuild, and the migration below reads them.
+	db.run(`CREATE TABLE IF NOT EXISTS design_sources (
+		id TEXT PRIMARY KEY,
+		design_id TEXT NOT NULL,
+		kind TEXT NOT NULL DEFAULT 'image',
+		ordinal INTEGER NOT NULL DEFAULT 0,
+		source_name TEXT NOT NULL DEFAULT '',
+		url TEXT NOT NULL DEFAULT '',
+		mime TEXT NOT NULL DEFAULT '',
+		bytes INTEGER NOT NULL DEFAULT 0,
+		width INTEGER NOT NULL DEFAULT 0,
+		height INTEGER NOT NULL DEFAULT 0,
+		thumb INTEGER NOT NULL DEFAULT 0,
+		render INTEGER NOT NULL DEFAULT 0,
+		/** For url sources: the extracted evidence handed to the model. */
+		extract TEXT NOT NULL DEFAULT '',
+		created INTEGER NOT NULL
+	)`);
+	db.run("CREATE INDEX IF NOT EXISTS design_sources_design ON design_sources(design_id, ordinal)");
+}
+
+/**
+ * Give every pre-existing design the source row it always implicitly had. Idempotent: a
+ * design that already has sources is skipped, so this is safe on every open. The source
+ * keeps the design's own id, which is what makes the blob on disk resolve unchanged.
+ */
+function backfillDesignSources(db: Database): void {
+	const orphans = db
+		.query(
+			`SELECT d.id, d.source_name, d.mime, d.bytes, d.width, d.height, d.thumb, d.render, d.created
+			 FROM designs d
+			 WHERE NOT EXISTS (SELECT 1 FROM design_sources s WHERE s.design_id = d.id)`,
+		)
+		.all() as Array<{
+		id: string;
+		source_name: string;
+		mime: string;
+		bytes: number;
+		width: number;
+		height: number;
+		thumb: number;
+		render: number;
+		created: number;
+	}>;
+	if (orphans.length === 0) return;
+	const insert = db.prepare(
+		`INSERT OR IGNORE INTO design_sources
+		 (id, design_id, kind, ordinal, source_name, url, mime, bytes, width, height, thumb, render, extract, created)
+		 VALUES (?, ?, 'image', 0, ?, '', ?, ?, ?, ?, ?, ?, '', ?)`,
+	);
+	const run = db.transaction(() => {
+		for (const o of orphans) {
+			insert.run(o.id, o.id, o.source_name, o.mime, o.bytes, o.width, o.height, o.thumb, o.render, o.created);
+		}
+	});
+	run();
+	console.log(`[designs] moved ${orphans.length} design(s) onto the multi-reference layout`);
 }
 
 /**

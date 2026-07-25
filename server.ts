@@ -11,17 +11,24 @@ import {
 	type SyncProvider,
 } from "./src/config";
 import { killChildren, status as claudeStatus } from "./src/claude-cli";
+import { buildPayload, type UrlCapture, captureUrl } from "./src/design-url";
+import { CSS_LIMITS, guardedFetch } from "./src/url-guard";
 import { consolidate } from "./src/consolidate";
 import { enqueueDesign, restoreDesignNote, resumeExtractions, retryExtraction } from "./src/design-extract";
 import {
+	addSource,
 	forgetDesign,
 	getDesign,
 	imagePath,
 	listDesigns,
+	listSources,
 	MAX_DESIGN_BYTES,
+	removeSource,
 	saveDesign,
+	saveUrlDesign,
 	sweepPartFiles,
 	thumbPath,
+	updateDesign,
 	validId,
 } from "./src/design-store";
 import { embedPendingEpisodes, recordEpisode } from "./src/episodic";
@@ -191,6 +198,62 @@ function blobResponse(path: string, mime: string): Response {
 	});
 }
 
+/** What the dashboard shows about a capture, without the whole payload. */
+function captureSummary(cap: UrlCapture) {
+	return {
+		url: cap.url,
+		title: cap.title,
+		frameworks: cap.frameworks,
+		colors: cap.palette.slice(0, 12).map((p) => ({ hex: p.hex, role: p.role })),
+		fonts: cap.fonts.slice(0, 4),
+		radii: cap.radii.slice(0, 4),
+		sheetsRead: cap.stats.sheetsRead,
+		sheetsSeen: cap.stats.sheetsSeen,
+		rules: cap.stats.rules,
+		jsFilesRead: cap.stats.jsFilesRead,
+		notes: cap.notes,
+	};
+}
+
+/**
+ * Pull a picture the page offered (its og:image) through the same guard the page came
+ * through, and file it as an ordinary image reference. Best-effort: a board whose image
+ * would not download is still a perfectly good board.
+ */
+async function attachRemoteImage(designId: string, imageUrl: string): Promise<void> {
+	const res = await guardedFetch(imageUrl, {
+		...CSS_LIMITS,
+		maxBytes: 1_500_000,
+		accept: ["image/"],
+	});
+	if ("reject" in res) return;
+	// res.bytes, never res.body: a UTF-8 decode of a PNG is lossy and cannot be undone,
+	// so re-encoding the text would hand saveDesign corrupted octets and its magic-byte
+	// sniff would reject the image as "not an image".
+	// Name it for what it is. An og:image is whatever the site chose to show in a link
+	// preview — very often a logo card rather than a picture of the product — so the thing
+	// that later reads this board has to be able to tell it apart from a real screenshot.
+	const host = ((): string => {
+		try {
+			return new URL(imageUrl).hostname.replace(/^www\./, "");
+		} catch {
+			return "page";
+		}
+	})();
+	const saved = await saveDesign({ bytes: res.bytes, sourceName: `og:image from ${host}` });
+	if (!saved.ok) return;
+	addSource({
+		designId,
+		kind: "image",
+		id: saved.row.id,
+		sourceName: saved.row.source_name,
+		mime: saved.row.mime,
+		bytes: saved.row.bytes,
+		width: saved.row.width,
+		height: saved.row.height,
+	});
+}
+
 /**
  * Design library. The only endpoints in the package that accept a file upload, so the
  * size ceiling and the magic-byte check both live behind saveDesign() rather than being
@@ -198,6 +261,48 @@ function blobResponse(path: string, mime: string): Response {
  */
 async function handleDesigns(url: URL, req: Request, post: boolean): Promise<Response> {
 	const rest = url.pathname.slice("/api/designs".length).replace(/^\//, "");
+
+	// Capture a URL onto a board. Slow by nature — it fetches a page, its stylesheets and
+	// maybe some JS — so it answers only when the capture is done and the row exists.
+	if (rest === "url" && post) {
+		const body = (await req.json().catch(() => ({}))) as { url?: string; caption?: string; designId?: string };
+		const target = typeof body.url === "string" ? body.url.trim() : "";
+		if (!target) return jsonResponse({ ok: false, error: "no url given" }, 400);
+
+		const cap = await captureUrl(target);
+		if (!cap.ok && !cap.palette.length && !cap.ogImage) {
+			return jsonResponse({ ok: false, error: cap.reject ?? "nothing could be read from that page" }, 422);
+		}
+		const evidence = buildPayload(cap);
+
+		// Adding a link to an existing board is a reference, not a new design.
+		if (body.designId && validId(body.designId) && getDesign(body.designId)) {
+			addSource({
+				designId: body.designId,
+				kind: "url",
+				id: new Bun.CryptoHasher("sha256").update(`src:${cap.url}`).digest("hex").slice(0, 16),
+				sourceName: new URL(cap.url).hostname.replace(/^www\./, ""),
+				url: cap.url,
+				extract: evidence,
+			});
+			updateDesign(body.designId, { status: "queued", error: "" });
+			enqueueDesign(body.designId);
+			return jsonResponse({ ok: true, id: body.designId, capture: captureSummary(cap) });
+		}
+
+		const { row, fresh } = saveUrlDesign({
+			url: cap.url,
+			caption: body.caption,
+			name: cap.siteName || cap.title || undefined,
+			extract: evidence,
+		});
+		// The page's own picture of itself becomes an ordinary image reference, so the
+		// vision pass runs over it alongside the measurements.
+		if (cap.ogImage) await attachRemoteImage(row.id, cap.ogImage);
+		updateDesign(row.id, { status: "queued", error: "" });
+		enqueueDesign(row.id);
+		return jsonResponse({ ok: true, id: row.id, fresh, capture: captureSummary(cap) });
+	}
 
 	if (!rest) {
 		if (!post) {
@@ -248,9 +353,66 @@ async function handleDesigns(url: URL, req: Request, post: boolean): Promise<Res
 			} catch {
 				// Provenance is frozen text; a malformed blob must not take the row down with it.
 			}
-			return jsonResponse({ row, spec });
+			// The board's references. `extract` is the full captured payload — kilobytes of
+			// it — so send only whether there is one, not the thing itself.
+			const sources = listSources(row.id).map((src) => ({
+				id: src.id,
+				kind: src.kind,
+				ordinal: src.ordinal,
+				name: src.source_name,
+				url: src.url,
+				mime: src.mime,
+				width: src.width,
+				height: src.height,
+				thumb: src.thumb,
+				captured: src.extract.length > 0,
+			}));
+			return jsonResponse({ row, spec, sources });
 		}
 		return jsonResponse({ error: `unknown design action: ${action}` }, 404);
+	}
+
+	// Add another screenshot to an existing board.
+	if (action === "attach") {
+		const form = await req.formData();
+		const file = form.get("file");
+		if (!(file instanceof Blob)) return jsonResponse({ ok: false, reason: "no-file" }, 400);
+		if (file.size > MAX_DESIGN_BYTES) return jsonResponse({ ok: false, reason: "too-large" }, 413);
+		const saved = await saveDesign({
+			bytes: new Uint8Array(await file.arrayBuffer()),
+			sourceName: (file instanceof File ? file.name : "") || "upload",
+			// The blob is stored, but the reference — not a second design — is the point.
+			status: "queued",
+		});
+		if (!saved.ok) return jsonResponse(saved, saved.reason === "too-large" ? 413 : 415);
+		addSource({
+			designId: id,
+			kind: "image",
+			id: saved.row.id,
+			sourceName: saved.row.source_name,
+			mime: saved.row.mime,
+			bytes: saved.row.bytes,
+			width: saved.row.width,
+			height: saved.row.height,
+			thumb: saved.row.thumb,
+			render: saved.row.render,
+		});
+		// The board changed, so its description is stale by definition.
+		updateDesign(id, { status: "queued", error: "" });
+		enqueueDesign(id);
+		return jsonResponse({ ok: true, sourceId: saved.row.id });
+	}
+
+	if (action === "detach") {
+		const body = (await req.json().catch(() => ({}))) as { sourceId?: string };
+		const sourceId = typeof body.sourceId === "string" ? body.sourceId : "";
+		if (!sourceId || !removeSource(sourceId)) return jsonResponse({ ok: false, error: "no such reference" }, 404);
+		const left = listSources(id);
+		if (left.length > 0) {
+			updateDesign(id, { status: "queued", error: "" });
+			enqueueDesign(id);
+		}
+		return jsonResponse({ ok: true, remaining: left.length });
 	}
 
 	if (action === "retry") return jsonResponse({ ok: retryExtraction(id) });
