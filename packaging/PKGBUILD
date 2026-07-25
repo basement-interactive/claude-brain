@@ -18,7 +18,7 @@ optdepends=('claude-code: LLM-assisted vault reorganisation and design descripti
 # debug passes walking several thousand vendor files to no purpose.
 options=('!strip' '!debug')
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('ad1dac10079fbdf8b8fffac8c58914d0b9d4632bd4733912f54512ca434d9795')
 
 build() {
 	cd "$pkgname-$pkgver"
@@ -76,11 +76,35 @@ SH
 	chmod 755 "$pkgdir/usr/bin/claude-brain"
 
 	install -Dm644 packaging/claude-brain.service "$pkgdir/usr/lib/systemd/user/claude-brain.service"
-	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-	# We redistribute ~25 MB of third-party binaries; ship their licences alongside.
-	install -Dm644 node_modules/onnxruntime-common/LICENSE \
-		"$pkgdir/usr/share/licenses/$pkgname/onnxruntime.LICENSE"
-	install -Dm644 node_modules/@anush008/tokenizers/LICENSE \
-		"$pkgdir/usr/share/licenses/$pkgname/tokenizers.LICENSE"
+
+	local lic="$pkgdir/usr/share/licenses/$pkgname"
+	install -Dm644 LICENSE "$lic/LICENSE"
+	# We redistribute ~25 MB of third-party binaries and owe an accounting of them, but
+	# none of these npm tarballs ships licence TEXT: a previous revision installed
+	# node_modules/onnxruntime-common/LICENSE and .../@anush008/tokenizers/LICENSE, paths
+	# that have never existed, and package() died on the first build. Take the terms from
+	# each package's own metadata rather than inventing a copyright line for someone
+	# else, and pass through a real licence file on the day upstream starts shipping one.
+	{
+		echo "claude-brain bundles the prebuilt native components below. Each is covered"
+		echo "by the licence declared in its own package metadata; upstream ships no"
+		echo "licence text for them in their npm tarballs."
+		echo
+		bun -e '
+			const names = ["onnxruntime-node", "onnxruntime-common",
+				"@anush008/tokenizers", "@anush008/tokenizers-linux-x64-gnu"];
+			for (const n of names) {
+				try {
+					const m = require(`./node_modules/${n}/package.json`);
+					const home = m.homepage ?? m.repository?.url ?? m.repository ?? "";
+					console.log(`${m.name}@${m.version}  ${m.license ?? "see upstream"}  ${home}`.trim());
+				} catch {}
+			}
+		'
+	} > "$lic/BUNDLED-LICENSES"
+	local f
+	for f in node_modules/onnxruntime-common/LICENSE node_modules/@anush008/tokenizers/LICENSE; do
+		[[ -f $f ]] && install -Dm644 "$f" "$lic/$(basename "$(dirname "$f")").LICENSE"
+	done
 	install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }
