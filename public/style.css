@@ -1025,3 +1025,15 @@ button.designs-drop { text-align: center; }
 /* .design-summary sets a display, and an author rule beats the UA's [hidden] no matter
    how specific — without this an empty summary still eats a row of card gap. */
 .design-summary[hidden] { display: none; }
+
+/* Shown only when the running server is older than the installed files. */
+.stale-banner {
+	grid-column: 1 / -1;
+	margin: 0;
+	padding: 10px 18px;
+	background: #7c2d12;
+	color: #fed7aa;
+	font-size: 13px;
+	line-height: 1.5;
+	border-bottom: 1px solid #9a3412;
+}

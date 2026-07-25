@@ -1,6 +1,6 @@
 {
 	"name": "claude-brain",
-	"version": "0.3.0",
+	"version": "0.3.1",
 	"description": "A local second brain for Claude Code: hybrid recall over notes and past sessions, episodic memory, note-graph traversal, design memory, 3D visualisation, cloud sync.",
 	"license": "MIT",
 	"type": "module",

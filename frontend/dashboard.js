@@ -19,9 +19,30 @@ function iconSettings() {
 	return '<svg viewBox="0 0 22 22" fill="none"><circle cx="11" cy="11" r="3" stroke="currentColor" stroke-width="1.4"/><path d="M11 2.8v2.4M11 16.8v2.4M19.2 11h-2.4M5.2 11H2.8M16.8 5.2l-1.7 1.7M6.9 15.1l-1.7 1.7M16.8 16.8l-1.7-1.7M6.9 6.9L5.2 5.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
 }
 
+// An upgrade leaves the old server serving the new dashboard, so the page calls
+// routes that version does not have and shows a bare "request failed (404)". The
+// server can see the mismatch (what booted vs what is on disk now); surface it
+// once, globally, because it breaks every tab rather than any particular one.
+async function warnIfStale(app) {
+	let status;
+	try {
+		status = await (await fetch("/api/status")).json();
+	} catch {
+		return;
+	}
+	if (!status?.stale) return;
+	const bar = document.createElement("div");
+	bar.className = "stale-banner";
+	bar.textContent =
+		`claude-brain ${status.installedVersion} is installed but version ${status.version} is still running — ` +
+		"restart it so the dashboard and the server agree:  systemctl --user restart claude-brain";
+	app.prepend(bar);
+}
+
 function build() {
 	const app = document.getElementById("app");
 	app.innerHTML = "";
+	warnIfStale(app);
 
 	const rail = document.createElement("aside");
 	rail.id = "rail";

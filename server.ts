@@ -89,6 +89,7 @@ function stripFrontmatter(raw: string): string {
 
 async function fullStatus() {
 	const cfg = loadConfig();
+	const installed = readInstalledVersion();
 	return {
 		index: indexStatus(),
 		vault: cfg.vault,
@@ -101,10 +102,32 @@ async function fullStatus() {
 		// status() short-circuits to reason "disabled" while enabled is false, so the
 		// binary is only ever looked for after opting in.
 		llm: await llmStatus(),
+		// A package upgrade rewrites these files underneath the running process, and
+		// systemd does not restart user services on upgrade. The old server then keeps
+		// serving the NEW dashboard off disk, the new dashboard calls routes that
+		// version has never heard of, and the user gets a bare "request failed (404)"
+		// with nothing pointing at the cause — which is exactly how 0.3.0's design tab
+		// looked to anyone who upgraded without restarting. RUNNING_VERSION is what
+		// booted; re-reading package.json per request is what is installed now.
+		version: RUNNING_VERSION,
+		installedVersion: installed,
+		stale: installed !== null && RUNNING_VERSION !== null && installed !== RUNNING_VERSION,
 	};
 }
 
 const LLM_MODELS = ["haiku", "sonnet", "opus"] as const;
+
+function readInstalledVersion(): string | null {
+	try {
+		const raw = readFileSync(join(import.meta.dir, "package.json"), "utf-8");
+		return (JSON.parse(raw) as { version?: string }).version ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/** Read once, at process start — this is the code actually running. */
+const RUNNING_VERSION = readInstalledVersion();
 
 async function llmStatus() {
 	const cfg = loadConfig();
