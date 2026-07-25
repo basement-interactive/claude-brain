@@ -1,4 +1,5 @@
-// Settings tab: vault selection, cloud sync, Claude Code integration, index health.
+// Settings tab: vault selection, cloud sync, Claude Code integration, image
+// description, index health.
 
 function el(tag, className, html) {
 	const node = document.createElement(tag);
@@ -48,6 +49,7 @@ export function createSettingsTab(container) {
 		renderVault();
 		renderSync();
 		renderIntegration();
+		renderLlm();
 		renderIndex();
 	}
 
@@ -180,6 +182,61 @@ export function createSettingsTab(container) {
 			await refresh();
 		};
 		s.appendChild(btn);
+		wrap.appendChild(s);
+	}
+
+	// --- Image description ---------------------------------------------------
+
+	// The design library says "Turn Claude on in Settings" when this is off. That
+	// sentence had nowhere to point: there was no control here, and /api/config
+	// only accepted a vault path — so the only way to switch it on was editing
+	// config.json by hand. This is that control.
+
+	const LLM_TROUBLE = {
+		"not-installed": "The claude CLI is not on PATH, so images are stored but not described.",
+		"not-logged-in": "The claude CLI is not signed in. Run <code>claude</code> in a terminal once to log in.",
+		"too-old": "The installed claude CLI is too old to read images. Update it and check again.",
+	};
+
+	function renderLlm() {
+		const llm = status.llm;
+		// Older server, newer page: say so instead of throwing on undefined.
+		if (!llm) return;
+		const s = section(
+			"Image description",
+			"Screenshots and mockups you add to the design library get read once and turned into " +
+			"notes. The reading is done by the claude CLI already installed on this machine, so " +
+			"your images never leave it — the brain uploads nothing, here or anywhere else.",
+		);
+
+		const toggle = el("button", `settings-btn ${llm.enabled ? "primary" : "ghost"}`,
+			llm.enabled ? "Description on" : "Description off");
+		toggle.onclick = async () => {
+			toggle.disabled = true;
+			const res = await api("/api/config", { llm: { enabled: !llm.enabled } });
+			if (res.error) {
+				toggle.disabled = false;
+				s.appendChild(el("div", "sync-hint warn", escapeHtml(res.error)));
+				return;
+			}
+			await refresh();
+		};
+		s.appendChild(toggle);
+
+		if (llm.enabled) {
+			if (llm.available) {
+				const who = [llm.account, llm.version && `CLI ${llm.version}`].filter(Boolean).join(" · ");
+				s.appendChild(el("div", "vault-current ok",
+					`<span class="dot"></span>Ready${who ? ` — ${escapeHtml(who)}` : ""}`));
+			} else {
+				s.appendChild(el("div", "sync-hint warn",
+					LLM_TROUBLE[llm.reason] ?? "Claude is not usable right now; images are stored but not described."));
+			}
+		} else {
+			s.appendChild(el("p", "settings-sub",
+				"While this is off, images are still stored and searchable by name and caption — " +
+				"they just have no description attached."));
+		}
 		wrap.appendChild(s);
 	}
 

@@ -96,6 +96,27 @@ async function fullStatus() {
 		port: cfg.port,
 		sync: await syncStatus(),
 		integration: integrationStatus(),
+		// The Settings tab tells people to "turn Claude on" — it needs to know both
+		// whether they have (enabled) and whether it would work (the CLI probe).
+		// status() short-circuits to reason "disabled" while enabled is false, so the
+		// binary is only ever looked for after opting in.
+		llm: await llmStatus(),
+	};
+}
+
+const LLM_MODELS = ["haiku", "sonnet", "opus"] as const;
+
+async function llmStatus() {
+	const cfg = loadConfig();
+	const probe = await claudeStatus();
+	return {
+		enabled: cfg.llm.enabled,
+		model: cfg.llm.model,
+		available: probe.available,
+		reason: probe.reason ?? null,
+		binary: probe.binary,
+		account: probe.account ?? null,
+		version: probe.version ?? null,
 	};
 }
 
@@ -327,8 +348,23 @@ const server = Bun.serve({
 		if (url.pathname === "/api/vaults") return jsonResponse({ vaults: detectVaults() });
 
 		if (url.pathname === "/api/config" && post) {
-			const body = (await req.json()) as { vault?: string };
+			const body = (await req.json()) as { vault?: string; llm?: { enabled?: boolean; model?: string } };
 			if (typeof body.vault === "string") return switchVault(body.vault);
+			// model is a closed union, so an arbitrary string from a POST body must not
+			// reach the config file — an unknown model would be written once and then
+			// fail on every call afterwards.
+			const llm = body.llm;
+			const model = LLM_MODELS.find((m) => m === llm?.model);
+			if (llm && (typeof llm.enabled === "boolean" || model)) {
+				const patch: { enabled?: boolean; model?: (typeof LLM_MODELS)[number] } = {};
+				if (typeof llm.enabled === "boolean") patch.enabled = llm.enabled;
+				if (model) patch.model = model;
+				await saveConfig({ llm: { ...loadConfig().llm, ...patch } });
+				// The probe caches for a TTL, so without a forced re-read the dashboard
+				// would keep showing "disabled" for a minute after being switched on.
+				await claudeStatus(true);
+				return jsonResponse({ ok: true, llm: await llmStatus() });
+			}
 			return jsonResponse({ error: "nothing to update" }, 400);
 		}
 
