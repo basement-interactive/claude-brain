@@ -1,6 +1,6 @@
 // claude-brain server: hybrid recall API + 3D graph UI + settings + cloud sync.
 
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, readlinkSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
 	detectVaults,
@@ -298,11 +298,139 @@ function watchForUpgrade(stop: () => void): void {
 	}, 30_000).unref();
 }
 
-const server = Bun.serve({
+/** Numeric dotted compare. -1 / 0 / 1, unknown sorts lowest. */
+function compareVersions(a: string | null, b: string | null): number {
+	if (!a) return b ? -1 : 0;
+	if (!b) return 1;
+	const pa = a.split(".").map(Number);
+	const pb = b.split(".").map(Number);
+	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+		const x = pa[i] ?? 0;
+		const y = pb[i] ?? 0;
+		if (Number.isNaN(x) || Number.isNaN(y)) return 0;
+		if (x !== y) return x < y ? -1 : 1;
+	}
+	return 0;
+}
+
+/**
+ * The pid listening on `port`, or null. Read straight out of /proc rather than shelling
+ * out to ss or lsof, so this needs nothing installed: find the listening socket's inode
+ * in /proc/net/tcp{,6}, then find whose fd points at it. Only our own processes are
+ * readable, which is exactly the case that matters — a stale server of ours.
+ */
+function pidOnPort(port: number): number | null {
+	const wanted = port.toString(16).toUpperCase().padStart(4, "0");
+	const inodes = new Set<string>();
+	for (const table of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+		let raw: string;
+		try {
+			raw = readFileSync(table, "utf-8");
+		} catch {
+			continue;
+		}
+		for (const line of raw.split("\n").slice(1)) {
+			const f = line.trim().split(/\s+/);
+			// st 0A is LISTEN; local_address is host:port in hex
+			if (f.length < 10 || f[3] !== "0A" || !f[1]?.endsWith(`:${wanted}`)) continue;
+			if (f[9]) inodes.add(f[9]);
+		}
+	}
+	if (inodes.size === 0) return null;
+	for (const entry of readdirSync("/proc")) {
+		if (!/^\d+$/.test(entry)) continue;
+		let fds: string[];
+		try {
+			fds = readdirSync(`/proc/${entry}/fd`);
+		} catch {
+			continue; // another user's process, or it exited mid-scan
+		}
+		for (const fd of fds) {
+			try {
+				if (inodes.has(readlinkSync(`/proc/${entry}/fd/${fd}`).slice(8, -1))) return Number(entry);
+			} catch {
+				/* fd closed under us */
+			}
+		}
+	}
+	return null;
+}
+
+/**
+ * Something already holds our port. If it is an OLDER copy of us, take it over.
+ *
+ * A stale instance nothing will restart — a hand-started `bun server.ts`, or one the
+ * upgrade hook could not reach — otherwise keeps the port forever. The new server cannot
+ * bind, systemd retries it every few seconds for good, and the only way out is finding
+ * and killing bun by hand. That is exactly what the first person to upgrade had to do.
+ *
+ * Two independent confirmations before any signal, because SIGTERM to the wrong pid is
+ * unforgivable: the incumbent has to answer /api/status the way we do, AND the process
+ * holding the socket has to look like one of ours. Strictly older only, so a newer server
+ * is never displaced by an older one and two instances cannot ping-pong the port.
+ */
+async function evictStaleInstance(port: number): Promise<boolean> {
+	let theirs: { version?: string | null; vault?: unknown; index?: unknown };
+	try {
+		const res = await fetch(`http://127.0.0.1:${port}/api/status`, {
+			signal: AbortSignal.timeout(3000),
+		});
+		theirs = (await res.json()) as typeof theirs;
+	} catch {
+		console.error(`[port] ${port} is held by something that is not a claude-brain — not touching it`);
+		return false;
+	}
+	if (!("index" in theirs) || !("vault" in theirs)) {
+		console.error(`[port] ${port} answers, but not like a claude-brain — not touching it`);
+		return false;
+	}
+	const theirVersion = theirs.version ?? null;
+	if (compareVersions(theirVersion, RUNNING_VERSION) >= 0) {
+		console.error(
+			`[port] ${port} is already served by claude-brain ${theirVersion ?? "(pre-0.3.1)"}, ` +
+				`which is not older than this one (${RUNNING_VERSION}) — leaving it alone`,
+		);
+		return false;
+	}
+	const pid = pidOnPort(port);
+	if (pid === null || pid === process.pid) {
+		console.error(`[port] could not identify the process on ${port} — stop it by hand`);
+		return false;
+	}
+	let cmdline = "";
+	try {
+		cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8");
+	} catch {
+		/* raced with its exit */
+	}
+	if (!cmdline.includes("server.ts") && !cmdline.includes("claude-brain")) {
+		console.error(`[port] pid ${pid} holds ${port} but does not look like a claude-brain — not touching it`);
+		return false;
+	}
+	console.log(`[port] claude-brain ${theirVersion ?? "(pre-0.3.1)"} (pid ${pid}) is stale — asking it to exit`);
+	try {
+		process.kill(pid, "SIGTERM");
+	} catch {
+		return false;
+	}
+	// Its SIGTERM handler stops in-flight children and checkpoints the WAL before exiting.
+	for (let i = 0; i < 50; i++) {
+		await Bun.sleep(100);
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return true; // gone
+		}
+	}
+	console.error(`[port] pid ${pid} did not exit after 5 s — stop it by hand`);
+	return false;
+}
+
+const serveOptions = {
 	port: PORT,
 	// A cold graph build or first consolidation can outrun the 10 s default.
 	idleTimeout: 60,
-	async fetch(req) {
+	async fetch(req: Request) {
 		const url = new URL(req.url);
 		const post = req.method === "POST";
 		if (post && !sameOrigin(req)) return jsonResponse({ error: "cross-origin request rejected" }, 403);
@@ -430,7 +558,22 @@ const server = Bun.serve({
 
 		return new Response("Not found", { status: 404 });
 	},
-});
+};
+
+async function listen() {
+	try {
+		return Bun.serve(serveOptions);
+	} catch (err) {
+		if ((err as { code?: string })?.code !== "EADDRINUSE") throw err;
+		if (!(await evictStaleInstance(PORT))) {
+			console.error(`[port] ${PORT} is in use — claude-brain cannot start`);
+			process.exit(1);
+		}
+		return Bun.serve(serveOptions);
+	}
+}
+
+const server = await listen();
 
 console.log(`claude-brain serving on http://localhost:${server.port}`);
 startWatcher();
