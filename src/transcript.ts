@@ -117,6 +117,10 @@ function toolTarget(name: string, input: Record<string, unknown>): string {
 function tooSimilar(a: string, b: string): boolean {
 	const shorter = a.length < b.length ? a : b;
 	const longer = a.length < b.length ? b : a;
+	// Every string starts with "", so an empty side made this always true — and the seed
+	// value of `lastPrompt` is "". That silently dropped the FIRST prompt of every
+	// transcript, which is the one that says what the session was for.
+	if (!shorter.length) return false;
 	return longer.startsWith(shorter.slice(0, Math.min(120, shorter.length)));
 }
 

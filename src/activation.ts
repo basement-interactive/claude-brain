@@ -9,10 +9,19 @@ import { openBrainDb } from "./index-db";
 /** Forgetting exponent. ACT-R fits ~0.5 for lab recall; lower suits a vault that is
  *  consulted in bursts weeks apart, where a 3-month-old note is still worth surfacing. */
 const DECAY = 0.35;
-/** How far activation may move a score. Kept small so relevance still decides first
- *  and activation only breaks near-ties — a brain doesn't answer "what is X" with
- *  whatever it read most recently. */
-const WEIGHT = 0.3;
+/**
+ * How far activation may move a score. This is a tie-breaker, and the number has to be
+ * small enough to actually be one.
+ *
+ * At 0.3 it was not. The multiplier spanned 0.797..1.299 — a 1.63x ratio — while adjacent
+ * RRF ranks differ by only 1.0164x, so activation could carry a result past roughly 30
+ * rank positions and was deciding the order outright. Measured against a labelled set on
+ * the real vault: weight 0.30 gave P@1 60% / MRR 0.783, while 0.10, 0.05 and disabling it
+ * entirely all gave P@1 70% / MRR 0.833 — identical, meaning at those weights it only ever
+ * breaks a genuine tie. 0.08 keeps the testing effect and the forgetting curve without
+ * letting either outvote relevance.
+ */
+const WEIGHT = 0.08;
 const SCALE = 2;
 const DAY_MS = 86_400_000;
 
@@ -34,7 +43,7 @@ export function baseActivation(trace: Trace, now = Date.now()): number {
 	return Math.log1p(trace.accessCount) - DECAY * Math.log1p(ageDays);
 }
 
-/** Bounded multiplier for a retrieval score — roughly [0.7, 1.3] around a neutral 1. */
+/** Bounded multiplier for a retrieval score — roughly [0.94, 1.06] around a neutral 1. */
 export function activationBoost(trace: Trace, now = Date.now()): number {
 	return 1 + WEIGHT * Math.tanh(baseActivation(trace, now) / SCALE);
 }

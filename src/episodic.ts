@@ -3,6 +3,7 @@
 // nothing is curated. Consolidation later decides which of these traces earned a
 // place in the vault.
 
+import { statSync } from "node:fs";
 import { embedTexts } from "./embedder";
 import { openBrainDb } from "./index-db";
 import { type DraftEpisode, type EpisodeKind, listTranscripts, type MinedSession, mineTranscript } from "./transcript";
@@ -114,14 +115,44 @@ export function ingestSession(mined: MinedSession): number {
 }
 
 /**
- * Mine every session log newer than `sinceDays` into the episodic store. Safe to run
- * repeatedly — the fingerprint unique index makes re-ingestion a no-op.
+ * Mine every session log newer than `sinceDays`, skipping files whose bytes have not
+ * changed since the last pass.
+ *
+ * `skipPath` exists because finishSession has already mined the live session's own log —
+ * the largest file in the corpus — immediately before calling consolidate.
  */
-export function ingestTranscripts(sinceDays = 180): IngestStats {
+export function ingestTranscripts(sinceDays = 180, skipPath?: string): IngestStats {
+	const { db } = openBrainDb();
 	const since = Date.now() - sinceDays * 86_400_000;
 	const stats: IngestStats = { sessions: 0, episodes: 0 };
-	for (const { path } of listTranscripts(since)) {
+
+	const seen = new Map<string, { mtime: number; size: number }>();
+	for (const row of db.query("SELECT path, mtime, size FROM mined_transcripts").all() as Array<{
+		path: string;
+		mtime: number;
+		size: number;
+	}>) {
+		seen.set(row.path, { mtime: row.mtime, size: row.size });
+	}
+	const mark = db.query(
+		`INSERT INTO mined_transcripts (path, mtime, size, mined_at) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, size = excluded.size, mined_at = excluded.mined_at`,
+	);
+
+	for (const { path, mtime } of listTranscripts(since)) {
+		if (path === skipPath) continue;
+		let size = 0;
+		try {
+			size = statSync(path).size;
+		} catch {
+			continue;
+		}
+		const previous = seen.get(path);
+		// A transcript only ever grows, so identical mtime and size means identical bytes.
+		if (previous && previous.mtime === mtime && previous.size === size) continue;
+
 		const mined = mineTranscript(path);
+		mark.run(path, mtime, size, Date.now());
 		if (!mined) continue;
 		const added = ingestSession(mined);
 		if (added > 0) {

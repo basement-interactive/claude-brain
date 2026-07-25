@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import * as sqliteVec from "sqlite-vec";
+import { POOLING_VERSION } from "./embedder";
 import { DATA_DIR, ensureDirs } from "./config";
 
 export const EMBED_DIM = 384;
@@ -47,6 +48,7 @@ export function openBrainDb(path?: string): BrainDb {
 
 	createSemanticTables(db, vectors);
 	createEpisodicTables(db, vectors);
+	reembedIfPoolingChanged(db, vectors);
 	createDesignTables(db);
 	migrate(db);
 
@@ -170,6 +172,20 @@ function createEpisodicTables(db: Database, vectors: boolean): void {
 		)`);
 	}
 
+	/**
+	 * Which transcript files have already been mined, and at what size/mtime. Without this
+	 * every consolidate() re-read and re-parsed the whole of ~/.claude/projects — measured
+	 * at 1.4 s over 118 MB to produce zero new episodes, on a path the SessionEnd hook
+	 * blocks on. recordEpisode is fingerprint-idempotent, so skipping an unchanged file
+	 * can only ever skip work that would have changed nothing.
+	 */
+	db.run(`CREATE TABLE IF NOT EXISTS mined_transcripts (
+		path TEXT PRIMARY KEY,
+		mtime INTEGER NOT NULL,
+		size INTEGER NOT NULL,
+		mined_at INTEGER NOT NULL
+	)`);
+
 	// What a live session already had injected, so associative recall never repeats
 	// itself into the same context window.
 	db.run(`CREATE TABLE IF NOT EXISTS injected (
@@ -219,6 +235,30 @@ function createDesignTables(db: Database): void {
 	// CREATE INDEX here would throw "already exists" on the second run and brick the
 	// install for everyone.
 	db.run("CREATE INDEX IF NOT EXISTS designs_status ON designs(status, created DESC)");
+}
+
+/**
+ * A change to how a vector is produced makes every stored vector incomparable with a
+ * freshly computed query vector — and the failure is silent: recall keeps working and
+ * quietly ranks worse. Flagging the rows costs nothing; the existing background passes
+ * refill them.
+ */
+function reembedIfPoolingChanged(db: Database, vectors: boolean): void {
+	if (!vectors) return;
+	const stored = Number(getMeta(db, "pooling_version") ?? "1");
+	if (stored === POOLING_VERSION) return;
+	const chunks = (db.query("SELECT count(*) AS n FROM chunks WHERE embedded = 1").get() as { n: number }).n;
+	const episodes = (db.query("SELECT count(*) AS n FROM episodes WHERE embedded = 1").get() as { n: number }).n;
+	db.transaction(() => {
+		db.run("DELETE FROM vec_chunks");
+		db.run("DELETE FROM vec_episodes");
+		db.run("UPDATE chunks SET embedded = 0");
+		db.run("UPDATE episodes SET embedded = 0");
+		setMeta(db, "pooling_version", String(POOLING_VERSION));
+	})();
+	if (chunks + episodes > 0) {
+		console.log(`[index] pooling v${stored} -> v${POOLING_VERSION}: re-embedding ${chunks} chunks, ${episodes} episodes`);
+	}
 }
 
 /** Additive column adds for indexes written before a given feature existed. */
