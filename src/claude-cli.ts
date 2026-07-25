@@ -409,6 +409,7 @@ async function invoke(prompt: string, args: string[], opts: AskOptions): Promise
 			stderr: "pipe",
 		});
 		child = proc;
+		liveChildren.add(proc);
 
 		const timer = setTimeout(stop, timeoutMs);
 		opts.signal?.addEventListener("abort", onAbort, { once: true });
@@ -418,6 +419,7 @@ async function invoke(prompt: string, args: string[], opts: AskOptions): Promise
 			new Response(proc.stderr).text(),
 		]);
 		await proc.exited;
+		liveChildren.delete(proc);
 		clearTimeout(timer);
 
 		const envelope = safeParse<ResultEnvelope>(raw);
@@ -508,6 +510,28 @@ async function drain(): Promise<void> {
  * flight, so without this, cancelling a batch still spawns and bills everything queued
  * behind it.
  */
+/** Children still running, so shutdown can stop them rather than orphan them. */
+const liveChildren = new Set<ReturnType<typeof Bun.spawn>>();
+
+/**
+ * Kill any `claude` child still running. Called on shutdown: a vision or reorganize call
+ * can be 90 s of billed work, and exiting without this leaves it orphaned — still running,
+ * still billing the user, with its output going nowhere.
+ */
+export function killChildren(): number {
+	let killed = 0;
+	for (const child of liveChildren) {
+		try {
+			child.kill("SIGTERM");
+			killed++;
+		} catch {
+			/* already gone */
+		}
+	}
+	liveChildren.clear();
+	return killed;
+}
+
 export function cancelAll(): number {
 	const pending = queue.splice(0);
 	for (const job of pending) job.settle(null);

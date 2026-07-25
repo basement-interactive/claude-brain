@@ -10,7 +10,7 @@ import {
 	vaultRoot,
 	type SyncProvider,
 } from "./src/config";
-import { status as claudeStatus } from "./src/claude-cli";
+import { killChildren, status as claudeStatus } from "./src/claude-cli";
 import { consolidate } from "./src/consolidate";
 import { enqueueDesign, restoreDesignNote, resumeExtractions, retryExtraction } from "./src/design-extract";
 import {
@@ -29,7 +29,7 @@ import { rebuildGraph } from "./src/graph";
 import { buildGraph } from "./src/graph-builder";
 import { renderAffected, renderExplain, renderMap, renderPath } from "./src/graph-render";
 import { indexStatus } from "./src/hybrid-search";
-import { resetIndex } from "./src/index-db";
+import { openBrainDb, resetIndex } from "./src/index-db";
 import { reindex } from "./src/indexer";
 import { integrate, integrationStatus, unintegrate } from "./src/integrate";
 import { recall, recallMarkdown } from "./src/recall";
@@ -375,5 +375,23 @@ setInterval(() => {
 	}
 }, CONSOLIDATE_INTERVAL_MS).unref();
 
-process.on("SIGTERM", () => process.exit(0));
-process.on("SIGINT", () => process.exit(0));
+/**
+ * Exiting immediately orphaned any in-flight `claude` child — still running, still
+ * billing, output going nowhere. Stop them, let SQLite finish its WAL checkpoint, then go.
+ * Guarded because systemd sends SIGTERM and may follow with another.
+ */
+let shuttingDown = false;
+function shutdown(): void {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	const killed = killChildren();
+	if (killed > 0) console.log(`[shutdown] stopped ${killed} in-flight claude call(s)`);
+	try {
+		openBrainDb().db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+	} catch {
+		/* a reader still holds it; the next open recovers from the WAL anyway */
+	}
+	process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);

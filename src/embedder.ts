@@ -60,10 +60,25 @@ interface Loaded {
 
 let loaded: Loaded | null = null;
 let failed = false;
+/**
+ * The cold load takes ~700 ms. Without this, every caller arriving inside that window
+ * started its own — a reindex plus a hook plus a recall meant three concurrent ONNX
+ * sessions and three copies of the model, and whichever finished last won the singleton
+ * while the others stayed resident.
+ */
+let loading: Promise<Loaded | null> | null = null;
 
 async function load(): Promise<Loaded | null> {
 	if (loaded) return loaded;
 	if (failed) return null;
+	if (loading) return loading;
+	loading = doLoad().finally(() => {
+		loading = null;
+	});
+	return loading;
+}
+
+async function doLoad(): Promise<Loaded | null> {
 	try {
 		ensureDirs();
 		const ort = await import("onnxruntime-node");
