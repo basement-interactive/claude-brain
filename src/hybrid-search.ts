@@ -329,7 +329,7 @@ function poolByDoc(candidates: Candidate[]): Candidate[] {
 }
 
 /** Pull in notes that matched nothing but sit one association away from a strong match. */
-function addAssociations(pooled: Candidate[], limit: number): Candidate[] {
+function addAssociations(pooled: Candidate[], limit: number, pathPrefix?: string): Candidate[] {
 	if (pooled.length === 0 || limit <= 0) return pooled;
 	const seeds = new Map(pooled.map((c) => [c.docId, c.score]));
 	const spread = spreadActivation(seeds, limit);
@@ -352,7 +352,12 @@ function addAssociations(pooled: Candidate[], limit: number): Candidate[] {
 	const extra: Candidate[] = [];
 	for (const s of spread) {
 		const row = byDoc.get(s.docId);
-		if (row) extra.push({ ...row, score: s.score, via: titleByDoc.get(s.viaDocId) });
+		if (!row) continue;
+		// A folder-scoped recall must stay in the folder. Spreading runs after the scoped
+		// rankers, so without this an association drags a note from outside the scope into
+		// a result set the caller asked to be limited.
+		if (pathPrefix && !row.path.toLowerCase().startsWith(pathPrefix)) continue;
+		extra.push({ ...row, score: s.score, via: titleByDoc.get(s.viaDocId) });
 	}
 	return pooled.concat(extra);
 }
@@ -390,7 +395,7 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 	if (prefix) notes = notes.filter((c) => c.path.toLowerCase().startsWith(prefix));
 	applyGraphBoost(notes);
 	const pooled = poolByDoc(notes).sort((a, b) => b.score - a.score);
-	const topNotes = addAssociations(pooled.slice(0, k), Math.max(1, Math.round(k / 4)))
+	const topNotes = addAssociations(pooled.slice(0, k), Math.max(1, Math.round(k / 4)), prefix)
 		.sort((a, b) => b.score - a.score)
 		.slice(0, k);
 
