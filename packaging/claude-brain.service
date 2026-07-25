@@ -9,7 +9,7 @@ After=network.target
 # fine in the user's own terminal.
 Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin
 ExecStart=/usr/bin/bun /usr/share/claude-brain/server.ts
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]

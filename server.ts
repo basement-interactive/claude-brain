@@ -279,6 +279,25 @@ async function switchVault(path: string): Promise<Response> {
 	return jsonResponse({ ok: true, stats });
 }
 
+// A package upgrade rewrites these files underneath the running process, and systemd
+// does not restart user services on upgrade. The old server then keeps serving the NEW
+// dashboard off disk and answers 404 to every route it has never had — which is exactly
+// how 0.3.0's design tab looked to anyone who upgraded. Under systemd we can repair that
+// without asking anyone: step aside and let Restart=always bring us back on the new code.
+//
+// Only under systemd. INVOCATION_ID is set by it, and a hand-started server has nothing
+// to bring it back — exiting there would turn a cosmetic skew into a dead brain.
+function watchForUpgrade(stop: () => void): void {
+	if (!process.env.INVOCATION_ID) return;
+	setInterval(() => {
+		const installed = readInstalledVersion();
+		if (!installed || !RUNNING_VERSION || installed === RUNNING_VERSION) return;
+		console.log(`[upgrade] ${RUNNING_VERSION} -> ${installed}: restarting onto the new code`);
+		stop();
+		process.exit(0);
+	}, 30_000).unref();
+}
+
 const server = Bun.serve({
 	port: PORT,
 	// A cold graph build or first consolidation can outrun the 10 s default.
@@ -426,6 +445,8 @@ void embedPendingEpisodes();
 const reclaimed = resumeExtractions();
 const swept = sweepPartFiles();
 if (reclaimed > 0 || swept > 0) console.log(`[designs] resumed ${reclaimed}, cleared ${swept} partial file(s)`);
+
+watchForUpgrade(() => server.stop(true));
 const CONSOLIDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 setInterval(() => {
 	const report = consolidate(3);
