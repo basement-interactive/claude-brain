@@ -590,6 +590,12 @@ async function evictStaleInstance(port: number): Promise<boolean> {
 
 const serveOptions = {
 	port: PORT,
+	// Loopback only. Bun.serve defaults to 0.0.0.0, which put this dashboard on the LAN —
+	// tolerable when the worst a stranger could do was read the index, and not tolerable
+	// from 0.4.0, which added a route that makes this process fetch a URL they choose and
+	// pay for a model call to describe it. sameOrigin() is no defence there: it passes any
+	// request that simply omits an Origin header, which every non-browser client does.
+	hostname: "127.0.0.1",
 	// A cold graph build or first consolidation can outrun the 10 s default.
 	idleTimeout: 60,
 	async fetch(req: Request) {
