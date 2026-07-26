@@ -51,6 +51,7 @@ export function openBrainDb(path?: string): BrainDb {
 	reembedIfPoolingChanged(db, vectors);
 	createDesignTables(db);
 	migrate(db);
+	repairDesignSourcesKey(db);
 	backfillDesignSources(db);
 
 	opened = { db, vectors };
@@ -256,8 +257,11 @@ function createDesignTables(db: Database): void {
 	// `id` stays the content hash for images, so the blob on disk keeps its filename and
 	// identical uploads still dedupe. The legacy columns on `designs` are left alone rather
 	// than dropped: SQLite would need a table rebuild, and the migration below reads them.
+	// (design_id, id) rather than a global id: the same screenshot is legitimately a
+	// reference on more than one board — a colour study and a layout study can both cite
+	// it — and a global primary key made the second board's INSERT OR IGNORE a silent no-op.
 	db.run(`CREATE TABLE IF NOT EXISTS design_sources (
-		id TEXT PRIMARY KEY,
+		id TEXT NOT NULL,
 		design_id TEXT NOT NULL,
 		kind TEXT NOT NULL DEFAULT 'image',
 		ordinal INTEGER NOT NULL DEFAULT 0,
@@ -271,9 +275,11 @@ function createDesignTables(db: Database): void {
 		render INTEGER NOT NULL DEFAULT 0,
 		/** For url sources: the extracted evidence handed to the model. */
 		extract TEXT NOT NULL DEFAULT '',
-		created INTEGER NOT NULL
+		created INTEGER NOT NULL,
+		PRIMARY KEY (design_id, id)
 	)`);
 	db.run("CREATE INDEX IF NOT EXISTS design_sources_design ON design_sources(design_id, ordinal)");
+	db.run("CREATE INDEX IF NOT EXISTS design_sources_id ON design_sources(id)");
 }
 
 /**
@@ -281,6 +287,31 @@ function createDesignTables(db: Database): void {
  * design that already has sources is skipped, so this is safe on every open. The source
  * keeps the design's own id, which is what makes the blob on disk resolve unchanged.
  */
+/**
+ * An earlier build of this release created design_sources with a global `id PRIMARY KEY`,
+ * which silently refused to let a second board cite the same image. SQLite cannot alter a
+ * primary key, so rebuild the table when the old shape is found. Unreleased, so this only
+ * ever fires on a machine that ran a pre-release build.
+ */
+function repairDesignSourcesKey(db: Database): void {
+	const sql = (
+		db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='design_sources'").get() as
+			| { sql: string }
+			| undefined
+	)?.sql;
+	if (!sql || !/id TEXT PRIMARY KEY/.test(sql)) return;
+	db.transaction(() => {
+		db.run("ALTER TABLE design_sources RENAME TO design_sources_old");
+		createDesignTables(db);
+		db.run(`INSERT OR IGNORE INTO design_sources
+			(id, design_id, kind, ordinal, source_name, url, mime, bytes, width, height, thumb, render, extract, created)
+			SELECT id, design_id, kind, ordinal, source_name, url, mime, bytes, width, height, thumb, render, extract, created
+			FROM design_sources_old`);
+		db.run("DROP TABLE design_sources_old");
+	})();
+	console.log("[designs] rebuilt design_sources so one image can be cited by several boards");
+}
+
 function backfillDesignSources(db: Database): void {
 	const orphans = db
 		.query(

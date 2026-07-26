@@ -306,12 +306,14 @@ async function boardEvidence(
 			if (src.extract.trim()) extracts.push(src.extract);
 			continue;
 		}
-		if (!src.source_name.startsWith("og:image")) ogOnly = false;
 		const usable = await visionSource({ ...row, id: src.id, mime: src.mime, render: src.render } as DesignRow);
 		if ("blocked" in usable) {
 			if (usable.fixable) fixable = usable.blocked;
 			continue;
 		}
+		// Only images that actually made it into the call count: an unreadable screenshot
+		// must not clear the flag and suppress the caveat for the og:image that did.
+		if (!src.source_name.startsWith("og:image")) ogOnly = false;
 		images.push(usable.path);
 	}
 

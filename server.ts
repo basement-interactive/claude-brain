@@ -406,7 +406,7 @@ async function handleDesigns(url: URL, req: Request, post: boolean): Promise<Res
 	if (action === "detach") {
 		const body = (await req.json().catch(() => ({}))) as { sourceId?: string };
 		const sourceId = typeof body.sourceId === "string" ? body.sourceId : "";
-		if (!sourceId || !removeSource(sourceId)) return jsonResponse({ ok: false, error: "no such reference" }, 404);
+		if (!sourceId || !removeSource(id, sourceId)) return jsonResponse({ ok: false, error: "no such reference" }, 404);
 		const left = listSources(id);
 		if (left.length > 0) {
 			updateDesign(id, { status: "queued", error: "" });

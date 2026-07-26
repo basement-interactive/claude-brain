@@ -21,10 +21,14 @@
 //   - Byte caps count DECOMPRESSED bytes. Bun inflates transparently, so Content-Length
 //     describes the compressed stream and a 2 MB cap on it happily accepts a 2 GB bomb.
 //
-// Deliberately NOT solved here: DNS rebinding between the gate and the connect. Closing it
-// needs the socket pinned to the validated address; `pinnedFetch` does that where it can
-// and reports honestly when it cannot, because a pin that has been silently defeated is
-// worse than one the caller knows is absent.
+// Deliberately NOT solved here, and stated plainly because a guard is worse than useless if
+// its own comments overclaim: DNS rebinding between the gate and the connect. resolveAndGate
+// vets every address a name returns, then `fetch` resolves the name again itself, so a
+// record that changes in between is not caught. Closing it needs the socket pinned to an
+// address already checked — connecting to the literal and carrying the original Host and TLS
+// server name — which is a change to how every request here is issued, not a flag. Until
+// then the exposure is bounded by everything else on this page: a rebind still has to land
+// on a host willing to answer, and the response is only ever read as text or image bytes.
 
 import { BlockList, isIP } from "node:net";
 import { lookup } from "node:dns/promises";

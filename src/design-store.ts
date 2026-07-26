@@ -203,10 +203,17 @@ export interface AddSourceInput {
  * than a duplicate tile, which is what someone re-dragging a file actually means.
  */
 export function addSource(input: AddSourceInput): DesignSource | null {
+	// Upsert rather than ignore. Re-capturing a URL is the user asking for a fresh read of
+	// a page that has since changed, so keeping the old evidence would make the button lie.
+	// The ordinal is preserved so a refresh does not reshuffle the board.
 	openBrainDb().db.run(
-		`INSERT OR IGNORE INTO design_sources
+		`INSERT INTO design_sources
 		 (id, design_id, kind, ordinal, source_name, url, mime, bytes, width, height, thumb, render, extract, created)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(design_id, id) DO UPDATE SET
+		   source_name = excluded.source_name,
+		   url         = excluded.url,
+		   extract     = CASE WHEN excluded.extract != '' THEN excluded.extract ELSE design_sources.extract END`,
 		[
 			input.id,
 			input.designId,
@@ -232,11 +239,15 @@ export function addSource(input: AddSourceInput): DesignSource | null {
  * so the same bytes may well be cited by another board, and forgetDesign already owns the
  * question of which files are safe to delete.
  */
-export function removeSource(id: string): boolean {
+export function removeSource(designId: string, id: string): boolean {
 	const db = openBrainDb().db;
-	const before = db.query("SELECT COUNT(*) AS n FROM design_sources WHERE id = ?").get(id) as { n: number };
+	// Scoped to the board. Unscoped, POST /api/designs/<A>/detach could strip a reference
+	// off board B just by naming its id, and the same image is deliberately citable twice.
+	const before = db
+		.query("SELECT COUNT(*) AS n FROM design_sources WHERE design_id = ? AND id = ?")
+		.get(designId, id) as { n: number };
 	if (!before?.n) return false;
-	db.run("DELETE FROM design_sources WHERE id = ?", [id]);
+	db.run("DELETE FROM design_sources WHERE design_id = ? AND id = ?", [designId, id]);
 	return true;
 }
 
@@ -365,6 +376,26 @@ export type SaveDesignResult =
  * bytes, so an SVG (script-capable, and we serve these back from the dashboard's own
  * origin) cannot get in by claiming to be a PNG.
  */
+/**
+ * Give a freshly stored image the reference row that makes it a board of one. Without this
+ * the row only becomes a board on the next database open, when the backfill notices — so
+ * attaching a second screenshot in between produced a board whose FIRST image was invisible.
+ */
+function registerOwnSource(row: DesignRow): void {
+	addSource({
+		designId: row.id,
+		kind: "image",
+		id: row.id,
+		sourceName: row.source_name,
+		mime: row.mime,
+		bytes: row.bytes,
+		width: row.width,
+		height: row.height,
+		thumb: row.thumb,
+		render: row.render,
+	});
+}
+
 export async function saveDesign(input: SaveDesignInput): Promise<SaveDesignResult> {
 	if (input.bytes.length > MAX_DESIGN_BYTES) return { ok: false, reason: "too-large" };
 	const mime = sniffMime(input.bytes);
@@ -399,7 +430,9 @@ export async function saveDesign(input: SaveDesignInput): Promise<SaveDesignResu
 			patch.error = "";
 		}
 		updateDesign(id, patch);
-		return { ok: true, row: getDesign(id)!, fresh: false, requeued };
+		const existingRow = getDesign(id)!;
+		registerOwnSource(existingRow);
+		return { ok: true, row: existingRow, fresh: false, requeued };
 	}
 
 	// ON CONFLICT because the check above is not atomic across processes: a dashboard drop
@@ -429,7 +462,9 @@ export async function saveDesign(input: SaveDesignInput): Promise<SaveDesignResu
 			input.status ?? "queued",
 			Date.now(),
 		);
-	return { ok: true, row: getDesign(id)!, fresh: insert.changes > 0, requeued: false };
+	const stored = getDesign(id)!;
+	registerOwnSource(stored);
+	return { ok: true, row: stored, fresh: insert.changes > 0, requeued: false };
 }
 
 /**
@@ -593,11 +628,18 @@ export interface ListOptions {
 export function listDesigns(options: ListOptions = {}): DesignRow[] {
 	const { db } = openBrainDb();
 	const root = vaultRoot() ?? "";
+	// A screenshot attached to someone else's board, or an og:image pulled in by a capture,
+	// is stored as a designs row so its blob has somewhere to live — but it is a REFERENCE,
+	// not a design of its own, and listing it puts a stray tile in the grid for something
+	// the user never added. Hide any row that another board cites.
 	return db
 		.query(
-			`SELECT * FROM designs
-			 WHERE ? = 1 OR vault = ? OR vault = ''
-			 ORDER BY CASE WHEN vault = ? THEN 0 WHEN vault = '' THEN 1 ELSE 2 END, created DESC
+			`SELECT d.* FROM designs d
+			 WHERE (? = 1 OR d.vault = ? OR d.vault = '')
+			   AND NOT EXISTS (
+			     SELECT 1 FROM design_sources s WHERE s.id = d.id AND s.design_id != d.id
+			   )
+			 ORDER BY CASE WHEN d.vault = ? THEN 0 WHEN d.vault = '' THEN 1 ELSE 2 END, d.created DESC
 			 LIMIT ?`,
 		)
 		.all(options.all ? 1 : 0, root, root, options.limit ?? 500) as DesignRow[];
@@ -693,6 +735,9 @@ export function forgetDesign(
 	// The row goes first. Anything after it is best-effort cleanup, and a row that outlives
 	// its bytes is the one outcome with no way back: the grid shows a tile whose image 404s
 	// and whose second forget reports an empty plan.
+	// References are not foreign-keyed, so they have to go explicitly or a forgotten board
+	// leaves rows behind pointing at a design nothing can open.
+	openBrainDb().db.query("DELETE FROM design_sources WHERE design_id = ?").run(id);
 	openBrainDb().db.query("DELETE FROM designs WHERE id = ?").run(id);
 
 	const removed: string[] = [];
