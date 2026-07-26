@@ -313,11 +313,18 @@ function repairDesignSourcesKey(db: Database): void {
 }
 
 function backfillDesignSources(db: Database): void {
+	// "Has no references" is not the same as "was never migrated". A user who detaches every
+	// reference from a board leaves it empty on purpose, and re-adding one on the next open
+	// resurrects what they removed. A URL board is empty of IMAGE bytes by construction, so
+	// the same query would fabricate an image reference pointing at a blob that never
+	// existed. Restrict to rows that actually have bytes, and only ever run this once.
+	if (getMeta(db, "design_sources_migrated") === "1") return;
 	const orphans = db
 		.query(
 			`SELECT d.id, d.source_name, d.mime, d.bytes, d.width, d.height, d.thumb, d.render, d.created
 			 FROM designs d
-			 WHERE NOT EXISTS (SELECT 1 FROM design_sources s WHERE s.design_id = d.id)`,
+			 WHERE d.bytes > 0 AND d.mime != ''
+			   AND NOT EXISTS (SELECT 1 FROM design_sources s WHERE s.design_id = d.id)`,
 		)
 		.all() as Array<{
 		id: string;
@@ -330,7 +337,10 @@ function backfillDesignSources(db: Database): void {
 		render: number;
 		created: number;
 	}>;
-	if (orphans.length === 0) return;
+	if (orphans.length === 0) {
+		setMeta(db, "design_sources_migrated", "1");
+		return;
+	}
 	const insert = db.prepare(
 		`INSERT OR IGNORE INTO design_sources
 		 (id, design_id, kind, ordinal, source_name, url, mime, bytes, width, height, thumb, render, extract, created)
@@ -342,6 +352,7 @@ function backfillDesignSources(db: Database): void {
 		}
 	});
 	run();
+	setMeta(db, "design_sources_migrated", "1");
 	console.log(`[designs] moved ${orphans.length} design(s) onto the multi-reference layout`);
 }
 

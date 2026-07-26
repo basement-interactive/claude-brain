@@ -89,6 +89,15 @@ describe("addressIsBlocked — IPv4 smuggled inside IPv6", () => {
 		expect(addressIsBlocked("2002:a9fe:a9fe::")).toBe(true);
 	});
 
+	test("a public address that merely contains ffff: is not treated as mapped", () => {
+		// The test was a substring search, so 2001:ffff::1 had its last two groups read as
+		// octets — blocking an ordinary public host.
+		expect(addressIsBlocked("2001:ffff::1")).toBe(false);
+		expect(addressIsBlocked("2606:4700:ffff::1111")).toBe(false);
+		// ...while the real mapped prefix is still caught.
+		expect(addressIsBlocked("::ffff:127.0.0.1")).toBe(true);
+	});
+
 	test("leaves genuinely public addresses alone", () => {
 		expect(addressIsBlocked("1.1.1.1")).toBe(false);
 		expect(addressIsBlocked("2606:4700:4700::1111")).toBe(false);

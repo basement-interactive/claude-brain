@@ -83,7 +83,9 @@ function embeddedV4(addr: string): string[] {
 	const groups = lower.split(":").filter(Boolean);
 	const isNat64 = lower.startsWith("64:ff9b:");
 	const isSixToFour = lower.startsWith("2002:");
-	const isMapped = lower.includes("ffff:") && groups.length >= 2;
+	// Anchored, not a substring search: `2001:ffff::1` is an ordinary public address, and
+	// treating it as v4-mapped read its last two groups as octets and blocked a real site.
+	const isMapped = lower.startsWith("::ffff:");
 	if ((isNat64 || isMapped) && groups.length >= 2) {
 		const hi = Number.parseInt(groups[groups.length - 2] ?? "", 16);
 		const lo = Number.parseInt(groups[groups.length - 1] ?? "", 16);
@@ -284,6 +286,13 @@ export async function guardedFetch(input: string, limits: FetchLimits): Promise<
 					"user-agent": UA,
 					accept: limits.accept.includes("text/css") ? "text/css,*/*;q=0.1" : "text/html,*/*;q=0.1",
 					"accept-language": "en",
+					// Refuse compression outright. The byte cap below counts what the reader
+					// retains, but Bun inflates ahead of the reader inside fetch, so a gzip
+					// bomb allocates gigabytes before a single chunk reaches us and the cap
+					// never gets to fire. Asking for identity means the wire bytes and the
+					// counted bytes are the same thing, which is the only version of this
+					// cap that actually bounds memory.
+					"accept-encoding": "identity",
 				},
 			} as RequestInit);
 		} catch {
