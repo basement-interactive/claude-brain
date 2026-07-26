@@ -21,6 +21,7 @@ import { askJson, status as claudeStatus, describeImagesJson, sessionSpendUsd, s
 import { loadConfig, vaultReady, vaultRoot } from "./config";
 import { type DesignSpec, normalizeSpec, writeDesignNote } from "./design-note";
 import { type DesignRow, type DesignSource, getDesign, imagePath, listSources, renderPath, sourcePath, updateDesign } from "./design-store";
+import { verifySpecAgainstEvidence } from "./design-url";
 import { imageMeta } from "./image-meta";
 import { openBrainDb } from "./index-db";
 
@@ -419,6 +420,20 @@ export async function extractDesign(id: string): Promise<void> {
 				DESIGN_SCHEMA,
 				opts,
 			);
+
+	// The capture told the model, in as many words, not to invent colours. Hold it to that:
+	// anything it named that the page never declared is dropped, and a near miss (a rounding
+	// difference from the local oklch conversion) is snapped back to the measured value.
+	// This is the whole reason colours are converted locally rather than passed through.
+	let verified = "";
+	if (described && board.evidence) {
+		const check = verifySpecAgainstEvidence(described as { palette?: Array<{ hex: string }> }, board.evidence);
+		if (check.dropped || check.repaired) {
+			verified = `${check.dropped} invented colour${check.dropped === 1 ? "" : "s"} dropped`;
+			if (check.repaired) verified += `, ${check.repaired} snapped to the measured value`;
+			console.log(`[designs] ${id}: ${verified}`);
+		}
+	}
 
 	if (!described) {
 		const st = await claudeStatus();

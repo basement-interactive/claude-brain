@@ -630,6 +630,28 @@ export function verifySpec<T extends { palette?: Array<{ hex: string }> }>(
 	const measured = new Set<string>([...cap.palette.map((p) => p.hex), ...cap.jsColors]);
 	const themeHex = toHex(cap.themeColor);
 	if (themeHex) measured.add(themeHex);
+	return verifyAgainst(spec, measured);
+}
+
+/**
+ * The same check at extraction time, where the capture object is long gone and all that
+ * survives is the payload text stored on the reference. That is enough: buildPayload
+ * prints every measured colour as a literal `#rrggbb`, so the evidence carries its own
+ * whitelist and no extra column is needed to re-derive it.
+ */
+export function verifySpecAgainstEvidence<T extends { palette?: Array<{ hex: string }> }>(
+	spec: T,
+	evidence: string,
+): { spec: T; dropped: number; repaired: number } {
+	const measured = new Set<string>();
+	for (const m of evidence.matchAll(/#[0-9a-fA-F]{6}\b/g)) measured.add(m[0].toLowerCase());
+	return verifyAgainst(spec, measured);
+}
+
+function verifyAgainst<T extends { palette?: Array<{ hex: string }> }>(
+	spec: T,
+	measured: Set<string>,
+): { spec: T; dropped: number; repaired: number } {
 	if (!Array.isArray(spec.palette) || measured.size === 0) return { spec, dropped: 0, repaired: 0 };
 
 	let dropped = 0;
